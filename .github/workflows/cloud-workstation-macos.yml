@@ -15,7 +15,7 @@ on:
 
 env:
   VNC_PORT: '5902'
-  VNC_DISPLAY: ':2'
+  VNC_DISPLAY: ':99'
   VNC_GEOMETRY: ${{ github.event.inputs.vnc_resolution || '1920x1080' }}
   WORKSPACE_DIR: '$HOME/Desktop/workspace'
   BACKUP_REPO: 'backup-files'
@@ -45,17 +45,13 @@ jobs:
           # Install XQuartz for X11 support
           brew install --cask xquartz
           
-          # Install x11vnc (we'll handle the crash issue)
+          # Install x11vnc
           brew install x11vnc
-          
-          # Install xterm for terminal in VNC
-          brew install xterm
           
           # Check installed binaries
           echo "📋 Installed:"
           ls -la /opt/X11/bin/Xvfb 2>/dev/null && echo "✅ Xvfb found" || echo "⚠️ Xvfb missing"
           which x11vnc && echo "✅ x11vnc found" || echo "⚠️ x11vnc missing"
-          which xterm && echo "✅ xterm found" || echo "⚠️ xterm missing"
           
           echo "✅ VNC components installed"
 
@@ -68,8 +64,7 @@ jobs:
           
           mkdir -p ~/.vnc
           
-          # Create password file for x11vnc using -storepasswd
-          # x11vnc uses its own password format
+          # Create password file for x11vnc
           x11vnc -storepasswd "$VNC_PASS" ~/.vnc/passwd
           
           # Create workspace
@@ -85,7 +80,8 @@ jobs:
           HEIGHT=$(echo "${{ env.VNC_GEOMETRY }}" | cut -d'x' -f2)
           
           # Start Xvfb (X Virtual Framebuffer)
-          /opt/X11/bin/Xvfb ${{ env.VNC_DISPLAY }} -screen 0 ${WIDTH}x${HEIGHT}x24 &
+          # Explicitly listen on TCP to allow local connections
+          /opt/X11/bin/Xvfb ${{ env.VNC_DISPLAY }} -screen 0 ${WIDTH}x${HEIGHT}x24 -listen tcp &
           XVFB_PID=$!
           echo "Xvfb PID: $XVFB_PID"
           echo $XVFB_PID > /tmp/xvfb_pid.txt
@@ -102,63 +98,48 @@ jobs:
             
             # Start xterm
             xterm -display ${{ env.VNC_DISPLAY }} -geometry 120x40+10+10 -fa 'Monospace' -fs 12 -title "macOS Terminal" &
-            XTERM_PID=$!
-            echo "xterm PID: $XTERM_PID"
             
             sleep 2
             
-            # Start x11vnc with better options to avoid crash
-            # The crash was due to password file format - now we use -storepasswd correctly
+            # Start x11vnc
+            # -listen 127.0.0.1 forces IPv4 localhost binding (avoids bad handshake)
+            echo "Starting x11vnc on 127.0.0.1:${{ env.VNC_PORT }}..."
+            
             x11vnc \
               -display ${{ env.VNC_DISPLAY }} \
               -rfbport ${{ env.VNC_PORT }} \
+              -listen 127.0.0.1 \
               -rfbauth ~/.vnc/passwd \
               -forever \
               -shared \
-              -noxdamage \
-              -noxfixes \
-              -noxrecord \
-              -nolookup \
-              -noipv6 \
               -bg \
               -o /tmp/x11vnc.log 2>&1 || {
               
               echo "⚠️ x11vnc failed, checking log..."
               cat /tmp/x11vnc.log 2>/dev/null || true
-              
-              # Try without password (less secure but works)
-              echo "🔄 Trying x11vnc without password auth..."
-              x11vnc \
-                -display ${{ env.VNC_DISPLAY }} \
-                -rfbport ${{ env.VNC_PORT }} \
-                -forever \
-                -shared \
-                -noxdamage \
-                -noxfixes \
-                -noxrecord \
-                -nolookup \
-                -noipv6 \
-                -bg \
-                -o /tmp/x11vnc.log 2>&1 || true
             }
             
-            sleep 3
+            sleep 5
             
-            # Check VNC status
+            # Check VNC status and ports
             if pgrep x11vnc > /dev/null; then
-              echo "✅ x11vnc running on port ${{ env.VNC_PORT }}"
+              echo "✅ x11vnc running"
               pgrep -a x11vnc
+              
+              # Check if port is open
+              echo "Checking port ${{ env.VNC_PORT }}..."
+              netstat -an | grep "${{ env.VNC_PORT }}" || echo "⚠️ Port ${{ env.VNC_PORT }} not found in netstat"
             else
-              echo "⚠️ x11vnc not running - checking logs"
+              echo "⚠️ x11vnc exited immediately - check log:"
               cat /tmp/x11vnc.log 2>/dev/null | tail -20
             fi
           else
             echo "❌ Xvfb failed to start"
+            exit 1
           fi
           
           # Save status for later
           pgrep x11vnc > /tmp/vnc_pid.txt 2>/dev/null || echo "0" > /tmp/vnc_pid.txt
-        continue-on-error: true
 
       - name: ☁️ Setup Cloudflare Tunnel
         run: |
@@ -166,7 +147,8 @@ jobs:
           
           brew install cloudflare/cloudflare/cloudflared
           
-          cloudflared tunnel --url tcp://localhost:${{ env.VNC_PORT }} > /tmp/cloudflare.log 2>&1 &
+          # Explicitly tunnel to 127.0.0.1 (IPv4)
+          cloudflared tunnel --url tcp://127.0.0.1:${{ env.VNC_PORT }} > /tmp/cloudflare.log 2>&1 &
           CF_PID=$!
           echo $CF_PID > /tmp/cf_pid.txt
           
@@ -361,6 +343,6 @@ jobs:
           while true; do
             sleep 1800
             echo "[$(date '+%H:%M:%S')] 💓"
-            pgrep cloudflared > /dev/null || cloudflared tunnel --url tcp://localhost:${{ env.VNC_PORT }} > /tmp/cloudflare.log 2>&1 &
+            pgrep cloudflared > /dev/null || cloudflared tunnel --url tcp://127.0.0.1:${{ env.VNC_PORT }} > /tmp/cloudflare.log 2>&1 &
             pgrep backup-watcher > /dev/null || nohup bash ~/backup-watcher.sh > /dev/null 2>&1 &
           done
