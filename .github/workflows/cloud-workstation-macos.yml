@@ -1,10 +1,9 @@
-name: ☁️ Cloud Workstation - macOS
+name: ☁️ Cloud Workstation - macOS (SSH + ngrok)
 
 on:
   workflow_dispatch:
 
 env:
-  VNC_PORT: '5902'
   WORKSPACE_DIR: '$HOME/Desktop/workspace'
   BACKUP_REPO: 'backup-files'
 
@@ -14,46 +13,75 @@ jobs:
     timeout-minutes: 360
     
     steps:
-      - name: 🖥️ Enable Screen Sharing (VNC)
+      - name: 📊 System Information
         run: |
-          echo "🔧 Enabling Screen Sharing..."
-          
-          # Set VNC password
-          VNC_PASS="${{ secrets.VNC_PASSWORD }}"
-          [ -z "$VNC_PASS" ] && VNC_PASS="P@ssw0rd123!"
-          
-          # Enable VNC/Screen Sharing
-          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -activate -configure -access -on \
-            -clientopts -setvnclegacy -vnclegacy yes \
-            -clientopts -setvncpw -vncpw "$VNC_PASS" \
-            -restart -agent -privs -all
-          
-          echo "✅ Screen Sharing enabled"
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║         macOS Cloud Workstation Setup                    ║"
+          echo "╚══════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "🖥️  macOS Version: $(sw_vers -productVersion)"
+          echo "💻 Chip: $(uname -m)"
+          echo "📂 User: $(whoami)"
+          echo ""
 
-      - name: ☁️ Setup Cloudflare Tunnel
+      - name: 🔐 Setup SSH Access via ngrok
+        env:
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
         run: |
-          echo "🌐 Setting up Cloudflare tunnel..."
+          echo "🔧 Setting up SSH access..."
           
-          # Install cloudflared via Homebrew
-          brew install cloudflare/cloudflare/cloudflared
+          # Install ngrok
+          brew install ngrok/ngrok/ngrok
           
-          # Start tunnel pointing to VNC port (5900 is default macOS VNC)
-          cloudflared tunnel --url tcp://localhost:5900 > /tmp/cloudflare.log 2>&1 &
+          # Configure ngrok if token is provided
+          if [ -n "$NGROK_AUTH_TOKEN" ]; then
+            ngrok config add-authtoken "$NGROK_AUTH_TOKEN"
+            echo "✅ ngrok authenticated"
+          else
+            echo "⚠️ No NGROK_AUTH_TOKEN secret - using free tier (limited)"
+          fi
           
-          echo "⏳ Waiting for tunnel..."
-          sleep 15
+          # Create SSH user password
+          SSH_PASS="${{ secrets.SSH_PASSWORD }}"
+          [ -z "$SSH_PASS" ] && SSH_PASS="P@ssw0rd123!"
           
-          # Extract hostname
+          # Enable SSH and set password
+          echo "🔑 Configuring SSH..."
+          
+          # Set runner password for SSH login
+          echo "runner:$SSH_PASS" | sudo chpasswd 2>/dev/null || {
+            # Alternative method for macOS
+            sudo dscl . -passwd /Users/runner "$SSH_PASS" 2>/dev/null || true
+          }
+          
+          # Enable SSH
+          sudo systemsetup -setremotelogin on 2>/dev/null || {
+            sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
+          }
+          
+          echo "✅ SSH enabled"
+          
+          # Start ngrok SSH tunnel in background
+          ngrok tcp 22 --log=stdout > /tmp/ngrok.log 2>&1 &
+          
+          echo "⏳ Waiting for ngrok tunnel..."
+          sleep 10
+          
+          # Extract ngrok URL
           for i in {1..30}; do
-            HOSTNAME=$(grep -oE "https://[a-z0-9-]+\.trycloudflare\.com" /tmp/cloudflare.log | head -1 | sed 's|https://||')
-            if [ -n "$HOSTNAME" ]; then
-              echo "$HOSTNAME" > /tmp/cf_host.txt
-              echo "✅ Tunnel: $HOSTNAME"
+            NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | grep -oE 'tcp://[0-9a-z.-]+:[0-9]+' | head -1)
+            if [ -n "$NGROK_URL" ]; then
+              echo "$NGROK_URL" > /tmp/ngrok_url.txt
+              echo "✅ ngrok tunnel: $NGROK_URL"
               break
             fi
             sleep 2
           done
+          
+          if [ -z "$NGROK_URL" ]; then
+            echo "⚠️ ngrok may still be initializing..."
+            cat /tmp/ngrok.log | tail -20
+          fi
 
       - name: 🐍 Install Python
         run: |
@@ -103,96 +131,147 @@ jobs:
             git clone --depth=1 "$BACKUP_URL" /tmp/backup-index
             
             if [ -f /tmp/backup-index/README.md ]; then
+              RESTORE_COUNT=0
               while IFS= read -r REPO_PATH; do
                 [ -z "$REPO_PATH" ] && continue
                 REPO_NAME=$(basename "$REPO_PATH")
                 echo "  📦 Restoring: $REPO_NAME"
-                git clone --depth=1 \
+                if git clone --depth=1 \
                   "https://x-access-token:${TOKEN}@github.com/${REPO_PATH}.git" \
-                  "$HOME/Desktop/workspace/${REPO_NAME}" 2>/dev/null || echo "    ⚠️ Failed"
+                  "$HOME/Desktop/workspace/${REPO_NAME}" 2>/dev/null; then
+                  RESTORE_COUNT=$((RESTORE_COUNT + 1))
+                  echo "    ✅ Restored"
+                else
+                  echo "    ⚠️ Failed"
+                fi
               done < <(grep -oE '^\s*-\s*\S+' /tmp/backup-index/README.md | sed 's/^.*- *//')
+              echo "✅ Restored $RESTORE_COUNT projects"
             fi
             rm -rf /tmp/backup-index
           else
             echo "📝 No backup repository found"
           fi
 
-      - name: 🔄 Deploy Backup Watcher
+      - name: 🔄 Deploy Backup Watcher v3.0
         run: |
-          echo "🔧 Deploying backup watcher..."
+          echo "🔧 Deploying backup watcher v3.0..."
           
           TOKEN="${{ secrets.GH_TOKEN }}"
           [ -z "$TOKEN" ] && TOKEN="${{ secrets.GITHUB_TOKEN }}"
           
-          # Create backup watcher script (using fswatch for macOS)
+          # Create v3.0 backup watcher for macOS
           cat > ~/backup-watcher.sh << 'EOFWATCHER'
           #!/bin/bash
+          
+          # BACKUP WATCHER v3.0 - macOS Edition
           WATCH_DIR="$HOME/Desktop/workspace"
           GITHUB_USER="GITHUB_USER_PLACEHOLDER"
           TOKEN="TOKEN_PLACEHOLDER"
           BACKUP_REPO="backup-files"
           LOG_FILE="$HOME/backup-watcher.log"
           TRACKED_FILE="$HOME/.backed-up-projects"
+          SYNC_INTERVAL=300
+          
+          touch "$TRACKED_FILE"
           
           log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
           
-          backup_project() {
+          is_synced() { grep -qx "$1" "$TRACKED_FILE" 2>/dev/null; }
+          mark_synced() { grep -qx "$1" "$TRACKED_FILE" 2>/dev/null || echo "$1" >> "$TRACKED_FILE"; }
+          
+          update_index() {
+            local PROJECT_NAME="$1"
+            (
+              rm -rf /tmp/backup-idx-$$
+              git clone --depth=1 "https://x-access-token:$TOKEN@github.com/$GITHUB_USER/$BACKUP_REPO.git" /tmp/backup-idx-$$ 2>/dev/null
+              cd /tmp/backup-idx-$$ 2>/dev/null || return
+              if ! grep -q "$GITHUB_USER/$PROJECT_NAME" README.md 2>/dev/null; then
+                echo "- $GITHUB_USER/$PROJECT_NAME" >> README.md
+                git add . && git commit -m "Add $PROJECT_NAME" && git push 2>/dev/null
+                log "  ✅ Updated backup index"
+              fi
+              rm -rf /tmp/backup-idx-$$
+            ) &
+          }
+          
+          backup_or_sync() {
             local PROJECT_PATH="$1"
             local PROJECT_NAME=$(basename "$PROJECT_PATH")
             
-            grep -qx "$PROJECT_NAME" "$TRACKED_FILE" 2>/dev/null && return
             [ -z "$(ls -A "$PROJECT_PATH" 2>/dev/null)" ] && return
+            cd "$PROJECT_PATH" || return
             
-            if [ -d "$PROJECT_PATH/.git" ]; then
-              cd "$PROJECT_PATH" && git remote -v | grep -q "github.com" && {
-                echo "$PROJECT_NAME" >> "$TRACKED_FILE"
+            if [ -d ".git" ]; then
+              REMOTE=$(git remote get-url origin 2>/dev/null || echo "")
+              
+              # External repo - fork it
+              if echo "$REMOTE" | grep -q "github.com" && ! echo "$REMOTE" | grep -qi "$GITHUB_USER"; then
+                log "🔄 External repo: $PROJECT_NAME - Forking..."
+                curl -s -X POST -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
+                  https://api.github.com/user/repos -d "{\"name\":\"$PROJECT_NAME\",\"private\":true}" >/dev/null 2>&1
+                sleep 2
+                git remote remove origin 2>/dev/null
+                git remote add origin "https://x-access-token:$TOKEN@github.com/$GITHUB_USER/$PROJECT_NAME.git"
+                BRANCH=$(git branch --show-current 2>/dev/null || echo "main")
+                if git push -u origin "$BRANCH" --force 2>/dev/null; then
+                  log "✅ Forked: $PROJECT_NAME"
+                  mark_synced "$PROJECT_NAME"
+                  update_index "$PROJECT_NAME"
+                fi
                 return
-              }
+              fi
+              
+              # Our repo - sync changes
+              if echo "$REMOTE" | grep -qi "$GITHUB_USER"; then
+                git add -A 2>/dev/null
+                if ! git diff --cached --quiet 2>/dev/null; then
+                  git commit -m "Auto-sync: $(date '+%Y-%m-%d %H:%M')" 2>/dev/null
+                  git push 2>/dev/null && log "🔄 Synced: $PROJECT_NAME"
+                fi
+                mark_synced "$PROJECT_NAME"
+                return
+              fi
             fi
             
-            log "📤 Backing up: $PROJECT_NAME"
+            # New project
+            is_synced "$PROJECT_NAME" && return
+            log "📤 New project: $PROJECT_NAME"
             
             curl -s -X POST -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
               https://api.github.com/user/repos -d "{\"name\":\"$PROJECT_NAME\",\"private\":true}" >/dev/null 2>&1
-            
             sleep 2
-            cd "$PROJECT_PATH"
+            
             [ ! -d ".git" ] && git init
             git add -A
-            git commit -m "Auto-backup - $(date '+%Y-%m-%d %H:%M')" 2>/dev/null
+            git commit -m "Initial commit - $(date '+%Y-%m-%d %H:%M')" 2>/dev/null
             git branch -M main
             git remote remove origin 2>/dev/null
             git remote add origin "https://x-access-token:$TOKEN@github.com/$GITHUB_USER/$PROJECT_NAME.git"
             
             if git push -u origin main --force 2>/dev/null; then
-              log "✅ Pushed: $PROJECT_NAME"
-              echo "$PROJECT_NAME" >> "$TRACKED_FILE"
+              log "✅ Backed up: $PROJECT_NAME"
+              mark_synced "$PROJECT_NAME"
+              update_index "$PROJECT_NAME"
             fi
           }
           
-          touch "$TRACKED_FILE"
-          log "👁️ Backup watcher started - macOS"
+          log "═══════════════════════════════════════════════════════════════"
+          log "👁️  BACKUP WATCHER v3.0 STARTED (macOS)"
+          log "   📂 Watching: $WATCH_DIR"
+          log "   🔄 Sync Interval: ${SYNC_INTERVAL}s"
+          log "═══════════════════════════════════════════════════════════════"
           
           # Initial scan
           for dir in "$WATCH_DIR"/*/; do
-            [ -d "$dir" ] && backup_project "$dir"
+            [ -d "$dir" ] && backup_or_sync "$dir"
           done
           
-          # Use fswatch for macOS file monitoring
-          fswatch -0 -e ".*" -i ".*/[^/]+$" "$WATCH_DIR" 2>/dev/null | while read -d "" path; do
-            dir=$(dirname "$path")
-            [ "$dir" = "$WATCH_DIR" ] && [ -d "$path" ] && {
-              sleep 10
-              backup_project "$path"
-            }
-          done &
-          
-          # Periodic scan every 5 minutes
+          # Continuous sync loop
           while true; do
-            sleep 300
-            log "🔍 Periodic scan..."
+            sleep $SYNC_INTERVAL
+            log "🔄 Sync cycle..."
             for dir in "$WATCH_DIR"/*/; do
-              [ -d "$dir" ] && backup_project "$dir"
+              [ -d "$dir" ] && backup_or_sync "$dir"
             done
           done
           EOFWATCHER
@@ -201,51 +280,84 @@ jobs:
           sed -i '' "s|GITHUB_USER_PLACEHOLDER|${GITHUB_ACTOR}|g" ~/backup-watcher.sh
           chmod +x ~/backup-watcher.sh
           
-          # Install fswatch
-          brew install fswatch
-          
           # Start watcher
           nohup bash ~/backup-watcher.sh > /dev/null 2>&1 &
-          echo "✅ Backup watcher deployed"
+          
+          echo "✅ Backup Watcher v3.0 deployed (macOS)"
+          echo "   ✨ Continuous sync every 5 min"
+          echo "   ✨ External repo forking"
 
       - name: 💡 Keep Alive & Connection Info
         run: |
-          CLOUDFLARE_HOST=$(cat /tmp/cf_host.txt 2>/dev/null || echo "")
+          NGROK_URL=$(cat /tmp/ngrok_url.txt 2>/dev/null || echo "")
           
           echo ""
-          echo "╔══════════════════════════════════════════════════════════╗"
-          echo "║    🚀 macOS CLOUD WORKSTATION READY  🚀                  ║"
-          echo "╚══════════════════════════════════════════════════════════╝"
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║                                                              ║"
+          echo "║    🚀 macOS CLOUD WORKSTATION READY (SSH ACCESS) 🚀         ║"
+          echo "║                                                              ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
           echo ""
           
-          if [ -n "$CLOUDFLARE_HOST" ]; then
-            echo "STEP 1: Run on LOCAL machine:"
-            echo "  cloudflared access tcp --hostname $CLOUDFLARE_HOST --url 127.0.0.1:${{ env.VNC_PORT }}"
+          if [ -n "$NGROK_URL" ]; then
+            # Parse host and port from ngrok URL
+            NGROK_HOST=$(echo "$NGROK_URL" | sed 's|tcp://||' | cut -d':' -f1)
+            NGROK_PORT=$(echo "$NGROK_URL" | sed 's|tcp://||' | cut -d':' -f2)
+            
+            echo "┌────────────────────────────────────────────────────────────────┐"
+            echo "│ 🔐 SSH CONNECTION                                              │"
+            echo "└────────────────────────────────────────────────────────────────┘"
             echo ""
-            echo "STEP 2: Connect VNC to localhost:${{ env.VNC_PORT }}"
-            if [ -n "${{ secrets.VNC_PASSWORD }}" ]; then
-              echo "  Password: [Your VNC_PASSWORD secret]"
+            echo "  ssh -p $NGROK_PORT runner@$NGROK_HOST"
+            echo ""
+            if [ -n "${{ secrets.SSH_PASSWORD }}" ]; then
+              echo "  Password: [Your SSH_PASSWORD secret]"
             else
               echo "  Password: P@ssw0rd123!"
             fi
+            echo ""
+            echo "┌────────────────────────────────────────────────────────────────┐"
+            echo "│ 💻 REMOTE VS CODE (SSH Extension)                              │"
+            echo "└────────────────────────────────────────────────────────────────┘"
+            echo ""
+            echo "  1. Install 'Remote - SSH' extension in VS Code"
+            echo "  2. Press F1 → 'Remote-SSH: Connect to Host'"
+            echo "  3. Enter: ssh://runner@$NGROK_HOST:$NGROK_PORT"
+            echo ""
           else
-            echo "⚠️ Tunnel still initializing..."
+            echo "⚠️ ngrok tunnel not ready - check 'Setup SSH Access' step"
           fi
           
           echo ""
-          echo "📊 Environment:"
-          echo "  🖥️ OS:          macOS"
+          echo "📊 Environment Details:"
+          echo "  🍎 OS:          macOS $(sw_vers -productVersion)"
+          echo "  💻 Chip:        $(uname -m)"
+          echo "  👤 User:        runner"
           echo "  📂 Workspace:   ~/Desktop/workspace"
-          echo "  ⏱️ Duration:    6 hours"
-          echo "  🔄 Backup:      Auto-sync v2.0"
+          echo "  ⏱️  Duration:    6 hours"
+          echo "  🔄 Backup:      v3.0 (Full sync + External repo forking)"
+          echo ""
+          echo "💡 Useful Commands:"
+          echo "  cd ~/Desktop/workspace    # Go to workspace"
+          echo "  code .                    # Open VS Code (via SSH)"
+          echo "  brew install <package>    # Install packages"
           echo ""
           
-          # Keep alive
+          # Keep alive with heartbeat
+          COUNTER=0
           while true; do
             sleep 1800
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 💓 Heartbeat"
+            COUNTER=$((COUNTER + 1))
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 💓 Heartbeat #$COUNTER"
             
-            # Restart watcher if needed
+            # Keep ngrok alive
+            if ! pgrep -f "ngrok" > /dev/null; then
+              echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🔄 Restarting ngrok..."
+              ngrok tcp 22 --log=stdout > /tmp/ngrok.log 2>&1 &
+              sleep 10
+            fi
+            
+            # Keep watcher alive
             if ! pgrep -f "backup-watcher.sh" > /dev/null; then
               nohup bash ~/backup-watcher.sh > /dev/null 2>&1 &
             fi
