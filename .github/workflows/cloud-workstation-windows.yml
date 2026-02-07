@@ -1,0 +1,95 @@
+name: ☁️ Cloud Workstation - Windows
+
+on:
+  workflow_dispatch:
+
+env:
+  WORKSPACE_DIR: 'C:\workspace'
+  BACKUP_REPO: 'backup-files'
+
+jobs:
+  windows-workstation:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    
+    steps:
+      - name: 🖥️ Enable Remote Desktop
+        shell: powershell
+        run: |
+          Write-Host "🔧 Enabling Remote Desktop..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+          Write-Host "✅ Remote Desktop enabled"
+
+      - name: 🔐 Configure RDP User
+        shell: powershell
+        run: |
+          $Password = "${{ secrets.RDP_PASSWORD }}"
+          if ([string]::IsNullOrEmpty($Password)) { $Password = "P@ssw0rd123!" }
+          $SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+          try { Set-LocalUser -Name $env:USERNAME -Password $SecurePassword } catch {}
+          try { Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:USERNAME -ErrorAction SilentlyContinue } catch {}
+          Write-Host "✅ RDP user configured"
+
+      - name: ☁️ Setup Cloudflare Tunnel
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "cloudflared.exe"
+          Start-Process -FilePath ".\cloudflared.exe" -ArgumentList "tunnel", "--url", "tcp://localhost:3389" -RedirectStandardOutput "cf.log" -RedirectStandardError "cf_err.log" -NoNewWindow
+          Start-Sleep -Seconds 15
+          $log = Get-Content "cf.log","cf_err.log" -ErrorAction SilentlyContinue | Out-String
+          if ($log -match "https://([a-z0-9-]+\.trycloudflare\.com)") {
+            $matches[1] | Out-File "cf_host.txt"
+            Write-Host "✅ Tunnel: $($matches[1])"
+          }
+
+      - name: 📦 Install Development Tools
+        shell: powershell
+        run: |
+          choco install python nodejs-lts vscode git --confirm --no-progress
+          refreshenv
+          Write-Host "✅ Dev tools installed"
+
+      - name: ⚙️ Configure Git & Workspace
+        shell: powershell
+        run: |
+          git config --global user.name "$env:GITHUB_ACTOR"
+          git config --global user.email "$env:GITHUB_ACTOR@users.noreply.github.com"
+          git config --global init.defaultBranch main
+          New-Item -ItemType Directory -Path "${{ env.WORKSPACE_DIR }}" -Force
+          Write-Host "✅ Git & workspace configured"
+
+      - name: 📥 Restore Projects from Backup
+        shell: powershell
+        run: |
+          $Token = "${{ secrets.GH_TOKEN }}"
+          if ([string]::IsNullOrEmpty($Token)) { $Token = "${{ secrets.GITHUB_TOKEN }}" }
+          $BackupUrl = "https://x-access-token:${Token}@github.com/$env:GITHUB_ACTOR/${{ env.BACKUP_REPO }}.git"
+          $result = git ls-remote $BackupUrl 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            git clone --depth=1 $BackupUrl "$env:TEMP\backup-index"
+            Get-Content "$env:TEMP\backup-index\README.md" | ForEach-Object {
+              if ($_ -match "^\s*-\s*(\S+)") {
+                $repo = $matches[1]; $name = Split-Path $repo -Leaf
+                git clone --depth=1 "https://x-access-token:${Token}@github.com/${repo}.git" "${{ env.WORKSPACE_DIR }}\$name" 2>$null
+              }
+            }
+            Remove-Item "$env:TEMP\backup-index" -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: 💡 Keep Alive & Connection Info
+        shell: powershell
+        run: |
+          $host = Get-Content "cf_host.txt" -ErrorAction SilentlyContinue
+          Write-Host "╔══════════════════════════════════════════════════════════╗"
+          Write-Host "║    🚀 WINDOWS CLOUD WORKSTATION READY  🚀                ║"
+          Write-Host "╚══════════════════════════════════════════════════════════╝"
+          if ($host) {
+            Write-Host "STEP 1: cloudflared access tcp --hostname $host --url 127.0.0.1:3389"
+            Write-Host "STEP 2: Connect RDP to localhost:3389"
+            Write-Host "  Username: runneradmin"
+            Write-Host "  Password: P@ssw0rd123! (or your RDP_PASSWORD secret)"
+          }
+          Write-Host "📂 Workspace: ${{ env.WORKSPACE_DIR }}"
+          while ($true) { Start-Sleep -Seconds 1800; Write-Host "💓 $(Get-Date)" }

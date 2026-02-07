@@ -1,0 +1,252 @@
+name: ☁️ Cloud Workstation - macOS
+
+on:
+  workflow_dispatch:
+
+env:
+  VNC_PORT: '5902'
+  WORKSPACE_DIR: '$HOME/Desktop/workspace'
+  BACKUP_REPO: 'backup-files'
+
+jobs:
+  macos-workstation:
+    runs-on: macos-latest
+    timeout-minutes: 360
+    
+    steps:
+      - name: 🖥️ Enable Screen Sharing (VNC)
+        run: |
+          echo "🔧 Enabling Screen Sharing..."
+          
+          # Set VNC password
+          VNC_PASS="${{ secrets.VNC_PASSWORD }}"
+          [ -z "$VNC_PASS" ] && VNC_PASS="P@ssw0rd123!"
+          
+          # Enable VNC/Screen Sharing
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on \
+            -clientopts -setvnclegacy -vnclegacy yes \
+            -clientopts -setvncpw -vncpw "$VNC_PASS" \
+            -restart -agent -privs -all
+          
+          echo "✅ Screen Sharing enabled"
+
+      - name: ☁️ Setup Cloudflare Tunnel
+        run: |
+          echo "🌐 Setting up Cloudflare tunnel..."
+          
+          # Install cloudflared via Homebrew
+          brew install cloudflare/cloudflare/cloudflared
+          
+          # Start tunnel pointing to VNC port (5900 is default macOS VNC)
+          cloudflared tunnel --url tcp://localhost:5900 > /tmp/cloudflare.log 2>&1 &
+          
+          echo "⏳ Waiting for tunnel..."
+          sleep 15
+          
+          # Extract hostname
+          for i in {1..30}; do
+            HOSTNAME=$(grep -oE "https://[a-z0-9-]+\.trycloudflare\.com" /tmp/cloudflare.log | head -1 | sed 's|https://||')
+            if [ -n "$HOSTNAME" ]; then
+              echo "$HOSTNAME" > /tmp/cf_host.txt
+              echo "✅ Tunnel: $HOSTNAME"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: 🐍 Install Python
+        run: |
+          echo "🐍 Installing Python..."
+          brew install python@3.11
+          python3 --version
+          pip3 --version
+          echo "✅ Python installed"
+
+      - name: 📦 Install Node.js
+        run: |
+          echo "📦 Installing Node.js..."
+          brew install node
+          node --version
+          npm --version
+          echo "✅ Node.js installed"
+
+      - name: 💻 Install Visual Studio Code
+        run: |
+          echo "💻 Installing VS Code..."
+          brew install --cask visual-studio-code
+          echo "✅ VS Code installed"
+
+      - name: ⚙️ Configure Git & Workspace
+        run: |
+          echo "⚙️ Configuring Git..."
+          git config --global user.name "${GITHUB_ACTOR}"
+          git config --global user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+          git config --global init.defaultBranch main
+          
+          # Create workspace
+          mkdir -p ~/Desktop/workspace
+          
+          echo "✅ Git & workspace configured"
+
+      - name: 📥 Restore Projects from Backup
+        run: |
+          echo "📥 Checking for project backups..."
+          
+          TOKEN="${{ secrets.GH_TOKEN }}"
+          [ -z "$TOKEN" ] && TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          
+          BACKUP_URL="https://x-access-token:${TOKEN}@github.com/${GITHUB_ACTOR}/${{ env.BACKUP_REPO }}.git"
+          
+          if git ls-remote "$BACKUP_URL" &>/dev/null; then
+            echo "📂 Restoring projects..."
+            git clone --depth=1 "$BACKUP_URL" /tmp/backup-index
+            
+            if [ -f /tmp/backup-index/README.md ]; then
+              while IFS= read -r REPO_PATH; do
+                [ -z "$REPO_PATH" ] && continue
+                REPO_NAME=$(basename "$REPO_PATH")
+                echo "  📦 Restoring: $REPO_NAME"
+                git clone --depth=1 \
+                  "https://x-access-token:${TOKEN}@github.com/${REPO_PATH}.git" \
+                  "$HOME/Desktop/workspace/${REPO_NAME}" 2>/dev/null || echo "    ⚠️ Failed"
+              done < <(grep -oE '^\s*-\s*\S+' /tmp/backup-index/README.md | sed 's/^.*- *//')
+            fi
+            rm -rf /tmp/backup-index
+          else
+            echo "📝 No backup repository found"
+          fi
+
+      - name: 🔄 Deploy Backup Watcher
+        run: |
+          echo "🔧 Deploying backup watcher..."
+          
+          TOKEN="${{ secrets.GH_TOKEN }}"
+          [ -z "$TOKEN" ] && TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          
+          # Create backup watcher script (using fswatch for macOS)
+          cat > ~/backup-watcher.sh << 'EOFWATCHER'
+          #!/bin/bash
+          WATCH_DIR="$HOME/Desktop/workspace"
+          GITHUB_USER="GITHUB_USER_PLACEHOLDER"
+          TOKEN="TOKEN_PLACEHOLDER"
+          BACKUP_REPO="backup-files"
+          LOG_FILE="$HOME/backup-watcher.log"
+          TRACKED_FILE="$HOME/.backed-up-projects"
+          
+          log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
+          
+          backup_project() {
+            local PROJECT_PATH="$1"
+            local PROJECT_NAME=$(basename "$PROJECT_PATH")
+            
+            grep -qx "$PROJECT_NAME" "$TRACKED_FILE" 2>/dev/null && return
+            [ -z "$(ls -A "$PROJECT_PATH" 2>/dev/null)" ] && return
+            
+            if [ -d "$PROJECT_PATH/.git" ]; then
+              cd "$PROJECT_PATH" && git remote -v | grep -q "github.com" && {
+                echo "$PROJECT_NAME" >> "$TRACKED_FILE"
+                return
+              }
+            fi
+            
+            log "📤 Backing up: $PROJECT_NAME"
+            
+            curl -s -X POST -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
+              https://api.github.com/user/repos -d "{\"name\":\"$PROJECT_NAME\",\"private\":true}" >/dev/null 2>&1
+            
+            sleep 2
+            cd "$PROJECT_PATH"
+            [ ! -d ".git" ] && git init
+            git add -A
+            git commit -m "Auto-backup - $(date '+%Y-%m-%d %H:%M')" 2>/dev/null
+            git branch -M main
+            git remote remove origin 2>/dev/null
+            git remote add origin "https://x-access-token:$TOKEN@github.com/$GITHUB_USER/$PROJECT_NAME.git"
+            
+            if git push -u origin main --force 2>/dev/null; then
+              log "✅ Pushed: $PROJECT_NAME"
+              echo "$PROJECT_NAME" >> "$TRACKED_FILE"
+            fi
+          }
+          
+          touch "$TRACKED_FILE"
+          log "👁️ Backup watcher started - macOS"
+          
+          # Initial scan
+          for dir in "$WATCH_DIR"/*/; do
+            [ -d "$dir" ] && backup_project "$dir"
+          done
+          
+          # Use fswatch for macOS file monitoring
+          fswatch -0 -e ".*" -i ".*/[^/]+$" "$WATCH_DIR" 2>/dev/null | while read -d "" path; do
+            dir=$(dirname "$path")
+            [ "$dir" = "$WATCH_DIR" ] && [ -d "$path" ] && {
+              sleep 10
+              backup_project "$path"
+            }
+          done &
+          
+          # Periodic scan every 5 minutes
+          while true; do
+            sleep 300
+            log "🔍 Periodic scan..."
+            for dir in "$WATCH_DIR"/*/; do
+              [ -d "$dir" ] && backup_project "$dir"
+            done
+          done
+          EOFWATCHER
+          
+          sed -i '' "s|TOKEN_PLACEHOLDER|${TOKEN}|g" ~/backup-watcher.sh
+          sed -i '' "s|GITHUB_USER_PLACEHOLDER|${GITHUB_ACTOR}|g" ~/backup-watcher.sh
+          chmod +x ~/backup-watcher.sh
+          
+          # Install fswatch
+          brew install fswatch
+          
+          # Start watcher
+          nohup bash ~/backup-watcher.sh > /dev/null 2>&1 &
+          echo "✅ Backup watcher deployed"
+
+      - name: 💡 Keep Alive & Connection Info
+        run: |
+          CLOUDFLARE_HOST=$(cat /tmp/cf_host.txt 2>/dev/null || echo "")
+          
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║    🚀 macOS CLOUD WORKSTATION READY  🚀                  ║"
+          echo "╚══════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          if [ -n "$CLOUDFLARE_HOST" ]; then
+            echo "STEP 1: Run on LOCAL machine:"
+            echo "  cloudflared access tcp --hostname $CLOUDFLARE_HOST --url 127.0.0.1:${{ env.VNC_PORT }}"
+            echo ""
+            echo "STEP 2: Connect VNC to localhost:${{ env.VNC_PORT }}"
+            if [ -n "${{ secrets.VNC_PASSWORD }}" ]; then
+              echo "  Password: [Your VNC_PASSWORD secret]"
+            else
+              echo "  Password: P@ssw0rd123!"
+            fi
+          else
+            echo "⚠️ Tunnel still initializing..."
+          fi
+          
+          echo ""
+          echo "📊 Environment:"
+          echo "  🖥️ OS:          macOS"
+          echo "  📂 Workspace:   ~/Desktop/workspace"
+          echo "  ⏱️ Duration:    6 hours"
+          echo "  🔄 Backup:      Auto-sync v2.0"
+          echo ""
+          
+          # Keep alive
+          while true; do
+            sleep 1800
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 💓 Heartbeat"
+            
+            # Restart watcher if needed
+            if ! pgrep -f "backup-watcher.sh" > /dev/null; then
+              nohup bash ~/backup-watcher.sh > /dev/null 2>&1 &
+            fi
+          done
