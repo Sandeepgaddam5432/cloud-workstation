@@ -358,25 +358,27 @@ jobs:
             rm -rf /tmp/new-backup /tmp/api_response.json
           fi
 
-      - name: 🔄 Deploy Improved Backup Watcher Service
+      - name: 🔄 Deploy Backup Watcher v3.0 (Full Sync)
         run: |
-          echo "🔧 Deploying improved backup watcher service..."
+          echo "🔧 Deploying Backup Watcher v3.0 with Full Sync..."
           
           # Determine authentication token
           TOKEN="${{ secrets.GH_TOKEN }}"
           [ -z "$TOKEN" ] && TOKEN="${{ secrets.GITHUB_TOKEN }}"
           
-          # Create improved backup watcher with HYBRID approach (inotify + periodic scan)
+          # Create v3.0 backup watcher with FULL SYNC capabilities
           cat > ~/backup-watcher.sh << 'EOFWATCHER'
           #!/bin/bash
           
           # ═══════════════════════════════════════════════════════════════════
-          # IMPROVED BACKUP WATCHER v2.0
+          # BACKUP WATCHER v3.0 - FULL SYNC EDITION
           # Features:
           #   1. Real-time monitoring via inotifywait
-          #   2. Periodic scanning for missed projects (every 5 minutes)
-          #   3. Tracked projects file to avoid duplicates
-          #   4. Better error handling and logging
+          #   2. CONTINUOUS SYNC - pushes ongoing file changes every 5 minutes
+          #   3. EXTERNAL REPO FORKING - cloned repos (like openai/skills) get
+          #      forked to your account automatically
+          #   4. Complete change tracking for all projects
+          #   5. Better error handling and logging
           # ═══════════════════════════════════════════════════════════════════
           
           # Configuration
@@ -387,7 +389,7 @@ jobs:
           LOCK_FILE="$HOME/.backup-watcher.lock"
           LOG_FILE="$HOME/backup-watcher.log"
           TRACKED_FILE="$HOME/.backed-up-projects"
-          SCAN_INTERVAL=300  # 5 minutes
+          SYNC_INTERVAL=300  # 5 minutes
           
           # Initialize tracked projects file
           touch "$TRACKED_FILE"
@@ -396,194 +398,211 @@ jobs:
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
           }
           
-          is_already_backed_up() {
+          is_synced() {
             local PROJECT_NAME="$1"
             grep -qx "$PROJECT_NAME" "$TRACKED_FILE" 2>/dev/null
           }
           
-          mark_as_backed_up() {
+          mark_synced() {
             local PROJECT_NAME="$1"
-            echo "$PROJECT_NAME" >> "$TRACKED_FILE"
+            if ! grep -qx "$PROJECT_NAME" "$TRACKED_FILE" 2>/dev/null; then
+              echo "$PROJECT_NAME" >> "$TRACKED_FILE"
+            fi
           }
           
-          backup_project() {
+          update_backup_index() {
+            local PROJECT_NAME="$1"
+            (
+              flock 200
+              rm -rf /tmp/backup-idx-$$
+              if git clone --depth=1 "https://x-access-token:$TOKEN@github.com/$GITHUB_USER/$BACKUP_REPO.git" /tmp/backup-idx-$$ 2>/dev/null; then
+                cd /tmp/backup-idx-$$
+                if ! grep -q "$GITHUB_USER/$PROJECT_NAME" README.md 2>/dev/null; then
+                  echo "- $GITHUB_USER/$PROJECT_NAME" >> README.md
+                  git add README.md
+                  git commit -m "Add $PROJECT_NAME" 2>/dev/null
+                  git push 2>/dev/null
+                  log "  ✅ Updated backup index"
+                fi
+                rm -rf /tmp/backup-idx-$$
+              fi
+            ) 200>$LOCK_FILE
+          }
+          
+          # Main backup/sync function - handles ALL scenarios
+          backup_or_sync() {
             local PROJECT_PATH="$1"
             local PROJECT_NAME=$(basename "$PROJECT_PATH")
-            
-            # Skip if already tracked
-            if is_already_backed_up "$PROJECT_NAME"; then
-              return 0
-            fi
+            local FORCE_SYNC="$2"  # "force" to sync even if tracked
             
             # Skip empty directories
             if [ -z "$(ls -A "$PROJECT_PATH" 2>/dev/null)" ]; then
-              log "⏭️  Skipping empty project: $PROJECT_NAME"
               return 0
             fi
             
-            # Skip if already initialized as git repo with remote
-            if [ -d "$PROJECT_PATH/.git" ]; then
-              if cd "$PROJECT_PATH" && git remote -v | grep -q "github.com"; then
-                log "⏭️  Already has GitHub remote: $PROJECT_NAME"
-                mark_as_backed_up "$PROJECT_NAME"
-                return 0
-              fi
-            fi
-            
-            log "📤 Backing up project: $PROJECT_NAME"
-            
-            # Create GitHub repository
-            HTTP_STATUS=$(curl -s -o /tmp/repo_create_$$.json -w "%{http_code}" \
-              -X POST \
-              -H "Authorization: token $TOKEN" \
-              -H "Content-Type: application/json" \
-              https://api.github.com/user/repos \
-              -d "{\"name\":\"$PROJECT_NAME\",\"private\":true,\"auto_init\":false}")
-            
-            if [ "$HTTP_STATUS" -ne 201 ] && [ "$HTTP_STATUS" -ne 422 ]; then
-              log "❌ Failed to create repository (HTTP $HTTP_STATUS)"
-              cat /tmp/repo_create_$$.json >> "$LOG_FILE" 2>/dev/null
-              rm -f /tmp/repo_create_$$.json
-              return 1
-            fi
-            
-            sleep 2
-            rm -f /tmp/repo_create_$$.json
-            
-            # Navigate to project
             cd "$PROJECT_PATH" || return 1
             
-            # Initialize git if needed
-            if [ ! -d ".git" ]; then
-              git init
-              log "  ✅ Git initialized"
-            fi
-            
-            # Add all files
-            git add -A
-            
-            # Commit if there are changes
-            if git diff --cached --quiet 2>/dev/null; then
-              log "  ℹ️  No changes to commit"
-            else
-              git commit -m "Auto-backup from cloud workstation - $(date '+%Y-%m-%d %H:%M')" 2>/dev/null
-              log "  ✅ Changes committed"
-            fi
-            
-            # Ensure main branch
-            git branch -M main 2>/dev/null
-            
-            # Add or update remote
-            git remote remove origin 2>/dev/null
-            git remote add origin "https://x-access-token:$TOKEN@github.com/$GITHUB_USER/$PROJECT_NAME.git"
-            
-            # Push
-            if git push -u origin main --force 2>/dev/null; then
-              log "✅ Pushed to GitHub: $PROJECT_NAME"
-              mark_as_backed_up "$PROJECT_NAME"
+            # SCENARIO 1: Already a git repo
+            if [ -d ".git" ]; then
+              CURRENT_REMOTE=$(git remote get-url origin 2>/dev/null || echo "")
               
-              # Update backup index (with file locking)
-              (
-                flock 200
+              # SCENARIO 1A: External repo (cloned from another user like openai/skills)
+              if echo "$CURRENT_REMOTE" | grep -q "github.com" && ! echo "$CURRENT_REMOTE" | grep -qi "$GITHUB_USER"; then
+                log "🔄 External repo detected: $PROJECT_NAME"
+                log "   Original: $CURRENT_REMOTE"
+                log "   Forking to your account..."
                 
-                rm -rf /tmp/backup-index-update-$$
+                # Create our private copy
+                curl -s -X POST -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
+                  https://api.github.com/user/repos \
+                  -d "{\"name\":\"$PROJECT_NAME\",\"private\":true}" >/dev/null 2>&1
                 
-                if git clone --depth=1 "https://x-access-token:$TOKEN@github.com/$GITHUB_USER/$BACKUP_REPO.git" /tmp/backup-index-update-$$ 2>/dev/null; then
-                  cd /tmp/backup-index-update-$$
-                  
-                  # Add to index if not already present
-                  if ! grep -q "$GITHUB_USER/$PROJECT_NAME" README.md 2>/dev/null; then
-                    echo "- $GITHUB_USER/$PROJECT_NAME" >> README.md
-                    git add README.md
-                    git commit -m "Add $PROJECT_NAME to backup index" 2>/dev/null
-                    git push 2>/dev/null
-                    log "✅ Updated backup index"
-                  fi
-                  
-                  cd ~
-                  rm -rf /tmp/backup-index-update-$$
+                sleep 2
+                
+                # Replace remote with our repo
+                git remote remove origin 2>/dev/null
+                git remote add origin "https://x-access-token:$TOKEN@github.com/$GITHUB_USER/$PROJECT_NAME.git"
+                
+                # Get current branch
+                CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "main")
+                
+                # Push all branches
+                if git push -u origin "$CURRENT_BRANCH" --force 2>/dev/null; then
+                  log "✅ Forked to your account: $PROJECT_NAME"
+                  mark_synced "$PROJECT_NAME"
+                  update_backup_index "$PROJECT_NAME" &
+                else
+                  log "❌ Failed to fork: $PROJECT_NAME"
                 fi
-              ) 200>$LOCK_FILE
+                return 0
+              fi
+              
+              # SCENARIO 1B: Already our repo - sync changes
+              if echo "$CURRENT_REMOTE" | grep -qi "$GITHUB_USER"; then
+                # Check for uncommitted changes
+                git add -A 2>/dev/null
+                if ! git diff --cached --quiet 2>/dev/null; then
+                  git commit -m "Auto-sync: $(date '+%Y-%m-%d %H:%M')" 2>/dev/null
+                  if git push 2>/dev/null; then
+                    log "🔄 Synced changes: $PROJECT_NAME"
+                  fi
+                fi
+                mark_synced "$PROJECT_NAME"
+                return 0
+              fi
+              
+              # SCENARIO 1C: Has .git but no remote or non-github remote
+              log "📤 Repo without GitHub remote: $PROJECT_NAME"
+              
+              curl -s -X POST -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
+                https://api.github.com/user/repos \
+                -d "{\"name\":\"$PROJECT_NAME\",\"private\":true}" >/dev/null 2>&1
+              
+              sleep 2
+              
+              git remote remove origin 2>/dev/null
+              git remote add origin "https://x-access-token:$TOKEN@github.com/$GITHUB_USER/$PROJECT_NAME.git"
+              git add -A
+              git commit -m "Auto-backup: $(date '+%Y-%m-%d %H:%M')" 2>/dev/null
+              git branch -M main 2>/dev/null
+              
+              if git push -u origin main --force 2>/dev/null; then
+                log "✅ Backed up: $PROJECT_NAME"
+                mark_synced "$PROJECT_NAME"
+                update_backup_index "$PROJECT_NAME" &
+              fi
+              return 0
               
             else
-              log "❌ Failed to push: $PROJECT_NAME"
-              return 1
+              # SCENARIO 2: New project - not a git repo
+              if is_synced "$PROJECT_NAME" && [ "$FORCE_SYNC" != "force" ]; then
+                return 0
+              fi
+              
+              log "📤 New project: $PROJECT_NAME"
+              
+              curl -s -X POST -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
+                https://api.github.com/user/repos \
+                -d "{\"name\":\"$PROJECT_NAME\",\"private\":true}" >/dev/null 2>&1
+              
+              sleep 2
+              
+              git init
+              git add -A
+              git commit -m "Initial commit - $(date '+%Y-%m-%d %H:%M')" 2>/dev/null
+              git branch -M main
+              git remote add origin "https://x-access-token:$TOKEN@github.com/$GITHUB_USER/$PROJECT_NAME.git"
+              
+              if git push -u origin main --force 2>/dev/null; then
+                log "✅ Backed up: $PROJECT_NAME"
+                mark_synced "$PROJECT_NAME"
+                update_backup_index "$PROJECT_NAME" &
+              else
+                log "❌ Failed to backup: $PROJECT_NAME"
+              fi
             fi
-            
-            return 0
           }
           
+          # Process newly detected project
           process_new_project() {
             local PROJECT_PATH="$1"
             local PROJECT_NAME=$(basename "$PROJECT_PATH")
             
             log "📁 Detected new project: $PROJECT_NAME"
             
-            # Wait for project to stabilize (files being copied)
-            sleep 10
+            # Wait for files to finish copying (git clone, extract, etc.)
+            sleep 15
             
-            backup_project "$PROJECT_PATH"
+            backup_or_sync "$PROJECT_PATH" "force"
           }
           
-          periodic_scan() {
+          # Continuous sync loop - syncs ALL changes every interval
+          continuous_sync() {
             while true; do
-              sleep $SCAN_INTERVAL
+              sleep $SYNC_INTERVAL
               
-              log "🔍 Running periodic scan..."
+              log "🔄 Running continuous sync..."
               
-              # Scan all directories in workspace
               for dir in "$WATCH_DIR"/*/; do
                 [ -d "$dir" ] || continue
-                
-                PROJECT_NAME=$(basename "$dir")
-                
-                # Skip already tracked
-                if is_already_backed_up "$PROJECT_NAME"; then
-                  continue
-                fi
-                
-                log "🔍 Found untracked project: $PROJECT_NAME"
-                backup_project "$dir"
+                backup_or_sync "$dir"
               done
               
-              log "🔍 Periodic scan complete"
+              log "🔄 Continuous sync complete"
             done
           }
           
-          # Export functions for subshells
-          export -f backup_project
-          export -f process_new_project
-          export -f log
-          export -f is_already_backed_up
-          export -f mark_as_backed_up
-          export WATCH_DIR GITHUB_USER BACKUP_REPO TOKEN LOCK_FILE LOG_FILE TRACKED_FILE
+          # Export for subshells
+          export -f backup_or_sync process_new_project log is_synced mark_synced update_backup_index
+          export WATCH_DIR GITHUB_USER BACKUP_REPO TOKEN LOCK_FILE LOG_FILE TRACKED_FILE SYNC_INTERVAL
           
           # ═══════════════════════════════════════════════════════════════════
           # MAIN EXECUTION
           # ═══════════════════════════════════════════════════════════════════
           
           log "═══════════════════════════════════════════════════════════════"
-          log "👁️  BACKUP WATCHER v2.0 STARTED"
+          log "👁️  BACKUP WATCHER v3.0 STARTED (FULL SYNC EDITION)"
           log "   📂 Watching: $WATCH_DIR"
           log "   👤 GitHub User: $GITHUB_USER"
-          log "   🔄 Scan Interval: ${SCAN_INTERVAL}s"
+          log "   🔄 Sync Interval: ${SYNC_INTERVAL}s (5 min)"
+          log "   ✨ Features: New projects, File changes, External repo forking"
           log "═══════════════════════════════════════════════════════════════"
           
-          # Initial scan for existing projects
-          log "🔍 Running initial scan for existing projects..."
+          # Initial full scan
+          log "🔍 Running initial scan..."
           for dir in "$WATCH_DIR"/*/; do
             [ -d "$dir" ] || continue
-            backup_project "$dir"
+            backup_or_sync "$dir" "force"
           done
           log "🔍 Initial scan complete"
           
-          # Start periodic scanner in background
-          periodic_scan &
-          SCANNER_PID=$!
-          log "🔄 Periodic scanner started (PID: $SCANNER_PID)"
+          # Start continuous sync in background
+          continuous_sync &
+          SYNC_PID=$!
+          log "🔄 Continuous sync started (PID: $SYNC_PID)"
           
-          # Start real-time watcher
-          log "👁️  Starting real-time file watcher..."
+          # Start real-time watcher for new directories
+          log "👁️  Starting real-time watcher..."
           inotifywait -m -e create -e moved_to --format '%w%f' "$WATCH_DIR" 2>/dev/null | while read NEW_PATH; do
             if [ -d "$NEW_PATH" ]; then
               process_new_project "$NEW_PATH" &
@@ -600,15 +619,21 @@ jobs:
           nohup bash ~/backup-watcher.sh > /dev/null 2>&1 &
           WATCHER_PID=$!
           
-          # Wait a moment and verify
+          # Verify startup
           sleep 3
           if pgrep -f "backup-watcher.sh" > /dev/null; then
-            echo "✅ Backup watcher v2.0 deployed (PID: $WATCHER_PID)"
-            echo "📋 Features:"
-            echo "   • Real-time detection via inotifywait"
-            echo "   • Periodic scan every 5 minutes"
-            echo "   • Automatic initial scan on startup"
-            echo "   • Better duplicate handling"
+            echo "✅ Backup Watcher v3.0 deployed (PID: $WATCHER_PID)"
+            echo ""
+            echo "📋 v3.0 Features:"
+            echo "   ✨ Real-time detection of new projects"
+            echo "   ✨ Continuous sync every 5 minutes (file changes)"
+            echo "   ✨ External repo forking (cloned repos backed up)"
+            echo "   ✨ Complete change tracking"
+            echo ""
+            echo "💡 What gets backed up:"
+            echo "   • New folders you create → Auto GitHub repo"
+            echo "   • Files you modify → Synced every 5 min"
+            echo "   • Cloned repos (like openai/skills) → Forked to your account"
           else
             echo "❌ Watcher failed to start"
             cat ~/backup-watcher.log
