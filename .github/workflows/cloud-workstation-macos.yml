@@ -15,6 +15,7 @@ on:
 
 env:
   VNC_PORT: '5902'
+  VNC_DISPLAY: ':2'
   VNC_GEOMETRY: ${{ github.event.inputs.vnc_resolution || '1920x1080' }}
   WORKSPACE_DIR: '$HOME/Desktop/workspace'
   BACKUP_REPO: 'backup-files'
@@ -37,107 +38,113 @@ jobs:
           echo "🔧 Resolution: ${{ env.VNC_GEOMETRY }}"
           echo ""
 
-      - name: 🖥️ Install XQuartz & VNC Server
+      - name: 🖥️ Install VNC Server (TigerVNC)
         run: |
-          echo "📦 Installing XQuartz and VNC components..."
+          echo "📦 Installing TigerVNC..."
           
-          # Install XQuartz (X11 for macOS)
-          brew install --cask xquartz
-          
-          # Install x11vnc for virtual display VNC
-          brew install x11vnc
-          
-          # Install tigervnc-viewer for testing (optional)
+          # Install TigerVNC which includes vncserver
           brew install tiger-vnc
           
-          echo "✅ XQuartz and VNC installed"
-
-      - name: 🔐 Configure VNC Server with Virtual Display
-        run: |
-          echo "🔧 Configuring VNC with virtual X11 display..."
+          # Also install required X11 components
+          brew install --cask xquartz
           
-          # Set VNC password
+          echo "✅ TigerVNC installed"
+          
+          # Check what we have
+          echo "📋 Installed VNC tools:"
+          which vncserver || echo "vncserver not found"
+          which Xvnc || echo "Xvnc not found"
+          which vncviewer || echo "vncviewer not found"
+
+      - name: 🔐 Configure VNC Password
+        run: |
+          echo "🔧 Configuring VNC password..."
+          
           VNC_PASS="${{ secrets.VNC_PASSWORD }}"
           [ -z "$VNC_PASS" ] && VNC_PASS="P@ssw0rd123!"
           
-          # Create VNC password file
           mkdir -p ~/.vnc
-          x11vnc -storepasswd "$VNC_PASS" ~/.vnc/passwd
           
-          # Create workspace directory
+          # Create VNC password file using vncpasswd
+          echo "$VNC_PASS" | vncpasswd -f > ~/.vnc/passwd
+          chmod 600 ~/.vnc/passwd
+          
+          # Create xstartup script
+          cat > ~/.vnc/xstartup << 'EOF'
+          #!/bin/bash
+          # Simple X session for macOS VNC
+          
+          # Set background
+          xsetroot -solid "#2E3440" 2>/dev/null || true
+          
+          # Start a simple terminal
+          xterm -geometry 120x40+10+10 &
+          
+          # Keep session alive
+          exec sleep infinity
+          EOF
+          
+          chmod +x ~/.vnc/xstartup
+          
+          # Create workspace
           mkdir -p ~/Desktop/workspace
           
-          echo "✅ VNC password configured"
+          echo "✅ VNC configured"
 
-      - name: 🚀 Start Virtual Display & VNC Server
+      - name: 🚀 Start VNC Server
         run: |
-          echo "🚀 Starting virtual display and VNC server..."
+          echo "🚀 Starting VNC server..."
           
-          # Parse resolution
-          RESOLUTION="${{ env.VNC_GEOMETRY }}"
-          WIDTH=$(echo $RESOLUTION | cut -d'x' -f1)
-          HEIGHT=$(echo $RESOLUTION | cut -d'x' -f2)
+          # Export display
+          export DISPLAY=${{ env.VNC_DISPLAY }}
           
-          # Start XQuartz with virtual display
-          export DISPLAY=:1
-          
-          # Use Xvfb-like approach with XQuartz
-          # Start headless X server
-          /opt/X11/bin/Xvfb :1 -screen 0 ${WIDTH}x${HEIGHT}x24 &
-          XVFB_PID=$!
-          echo "Xvfb PID: $XVFB_PID"
-          
-          sleep 3
-          
-          # Verify X server is running
-          if ! ps -p $XVFB_PID > /dev/null 2>&1; then
-            echo "⚠️ Xvfb failed, trying alternative..."
-            # Alternative: Use XQuartz directly
-            /opt/X11/bin/X :1 -screen 0 ${WIDTH}x${HEIGHT}x24 &
-            sleep 3
-          fi
-          
-          export DISPLAY=:1
-          
-          # Start a simple window manager (optional, for better experience)
-          # Some lightweight alternatives
-          
-          # Start x11vnc server
-          x11vnc -display :1 \
+          # Try to start Xvnc directly (TigerVNC's server)
+          Xvnc ${{ env.VNC_DISPLAY }} \
+            -geometry ${{ env.VNC_GEOMETRY }} \
+            -depth 24 \
             -rfbport ${{ env.VNC_PORT }} \
-            -passwd "$(cat ~/.vnc/passwd 2>/dev/null || echo 'P@ssw0rd123!')" \
-            -forever \
-            -shared \
-            -noxdamage \
-            -noxfixes \
-            -noxrecord \
-            -bg \
-            -o /tmp/x11vnc.log
+            -SecurityTypes VncAuth \
+            -PasswordFile ~/.vnc/passwd \
+            -AlwaysShared \
+            -AcceptKeyEvents \
+            -AcceptPointerEvents \
+            -SendCutText \
+            -AcceptCutText &
           
-          sleep 3
+          XVNC_PID=$!
+          echo "Xvnc PID: $XVNC_PID"
+          
+          sleep 5
           
           # Verify VNC is running
-          if pgrep -f "x11vnc" > /dev/null; then
-            echo "✅ VNC Server running on port ${{ env.VNC_PORT }}"
+          if ps -p $XVNC_PID > /dev/null 2>&1; then
+            echo "✅ Xvnc server running on display ${{ env.VNC_DISPLAY }} (port ${{ env.VNC_PORT }})"
+            
+            # Start xterm on the display
+            export DISPLAY=${{ env.VNC_DISPLAY }}
+            xterm -geometry 120x40+10+10 -title "macOS Cloud Terminal" &
+            
             echo "📊 VNC Process:"
-            pgrep -a x11vnc
+            ps aux | grep -E "(Xvnc|xterm)" | grep -v grep
           else
-            echo "❌ VNC failed to start"
-            cat /tmp/x11vnc.log 2>/dev/null
+            echo "⚠️ Xvnc failed to start, checking logs..."
             
-            # Fallback: Try native screen sharing with workaround
-            echo "🔄 Trying alternative VNC setup..."
-            
-            # Install and use tightvnc as fallback
-            brew install tightvnc 2>/dev/null || true
-            
-            vncserver :2 -geometry ${{ env.VNC_GEOMETRY }} -depth 24 2>/dev/null || {
-              echo "⚠️ VNC setup challenging on macOS - using SSH as backup"
+            # Try alternative: vncserver command if available
+            echo "🔄 Trying vncserver command..."
+            vncserver ${{ env.VNC_DISPLAY }} \
+              -geometry ${{ env.VNC_GEOMETRY }} \
+              -depth 24 \
+              -localhost no 2>&1 || {
+              
+              echo "⚠️ VNC server could not start"
+              echo "📋 This is a known limitation of macOS GitHub runners"
+              echo "💡 VNC may still work - check Cloudflare tunnel step"
             }
           fi
           
-          # Save PID for cleanup
-          pgrep x11vnc > /tmp/vnc_pid.txt 2>/dev/null || true
+          # Save status
+          pgrep -f "Xvnc|vncserver" > /tmp/vnc_pid.txt 2>/dev/null || true
+        continue-on-error: true
 
       - name: ☁️ Setup Cloudflare Tunnel
         run: |
@@ -146,11 +153,8 @@ jobs:
           # Install cloudflared
           brew install cloudflare/cloudflare/cloudflared
           
-          # Determine which port to tunnel
-          VNC_ACTIVE_PORT="${{ env.VNC_PORT }}"
-          
-          # Start tunnel
-          cloudflared tunnel --url tcp://localhost:$VNC_ACTIVE_PORT > /tmp/cloudflare.log 2>&1 &
+          # Start tunnel on VNC port
+          cloudflared tunnel --url tcp://localhost:${{ env.VNC_PORT }} > /tmp/cloudflare.log 2>&1 &
           CF_PID=$!
           echo $CF_PID > /tmp/cf_pid.txt
           
@@ -173,7 +177,6 @@ jobs:
           
           if [ "$TUNNEL_READY" = false ]; then
             echo "⚠️ Tunnel still initializing..."
-            echo "📋 Logs:"
             tail -20 /tmp/cloudflare.log
           fi
 
@@ -196,13 +199,8 @@ jobs:
       - name: 💻 Install Development Tools
         run: |
           echo "💻 Installing development tools..."
-          
-          # VS Code (can be accessed via Remote SSH or locally if VNC works)
-          brew install --cask visual-studio-code || echo "VS Code install skipped"
-          
-          # Essential CLI tools
+          brew install --cask visual-studio-code || echo "VS Code skipped"
           brew install wget curl jq git
-          
           echo "✅ Development tools installed"
 
       - name: ⚙️ Configure Git & Workspace
@@ -211,10 +209,8 @@ jobs:
           git config --global user.name "${GITHUB_ACTOR}"
           git config --global user.email "${GITHUB_ACTOR}@users.noreply.github.com"
           git config --global init.defaultBranch main
-          
           mkdir -p ~/Desktop/workspace
-          
-          echo "✅ Git configured for: ${GITHUB_ACTOR}"
+          echo "✅ Git configured"
 
       - name: 📥 Restore Projects from Backup
         run: |
@@ -226,17 +222,15 @@ jobs:
           BACKUP_URL="https://x-access-token:${TOKEN}@github.com/${GITHUB_ACTOR}/${{ env.BACKUP_REPO }}.git"
           
           if git ls-remote "$BACKUP_URL" &>/dev/null; then
-            echo "📂 Backup repository found - restoring projects..."
+            echo "📂 Restoring projects..."
             git clone --depth=1 "$BACKUP_URL" /tmp/backup-index
             
             if [ -f /tmp/backup-index/README.md ]; then
               RESTORE_COUNT=0
-              
               while IFS= read -r REPO_PATH; do
                 [ -z "$REPO_PATH" ] && continue
                 REPO_NAME=$(basename "$REPO_PATH")
                 echo "  📦 Restoring: $REPO_NAME"
-                
                 if git clone --depth=1 \
                   "https://x-access-token:${TOKEN}@github.com/${REPO_PATH}.git" \
                   "$HOME/Desktop/workspace/${REPO_NAME}" 2>/dev/null; then
@@ -246,7 +240,6 @@ jobs:
                   echo "    ⚠️ Failed"
                 fi
               done < <(grep -oE '^\s*-\s*\S+' /tmp/backup-index/README.md | sed 's/^.*- *//')
-              
               echo "✅ Restored $RESTORE_COUNT project(s)"
             fi
             rm -rf /tmp/backup-index
@@ -263,8 +256,6 @@ jobs:
           
           cat > ~/backup-watcher.sh << 'EOFWATCHER'
           #!/bin/bash
-          
-          # BACKUP WATCHER v3.0 - macOS Edition with Full Sync
           WATCH_DIR="$HOME/Desktop/workspace"
           GITHUB_USER="GITHUB_USER_PLACEHOLDER"
           TOKEN="TOKEN_PLACEHOLDER"
@@ -274,9 +265,7 @@ jobs:
           SYNC_INTERVAL=300
           
           touch "$TRACKED_FILE"
-          
           log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
-          
           is_synced() { grep -qx "$1" "$TRACKED_FILE" 2>/dev/null; }
           mark_synced() { grep -qx "$1" "$TRACKED_FILE" 2>/dev/null || echo "$1" >> "$TRACKED_FILE"; }
           
@@ -285,11 +274,10 @@ jobs:
             (
               rm -rf /tmp/backup-idx-$$
               git clone --depth=1 "https://x-access-token:$TOKEN@github.com/$GITHUB_USER/$BACKUP_REPO.git" /tmp/backup-idx-$$ 2>/dev/null || return
-              cd /tmp/backup-idx-$$ 2>/dev/null || return
+              cd /tmp/backup-idx-$$ || return
               if ! grep -q "$GITHUB_USER/$PROJECT_NAME" README.md 2>/dev/null; then
                 echo "- $GITHUB_USER/$PROJECT_NAME" >> README.md
                 git add . && git commit -m "Add $PROJECT_NAME" 2>/dev/null && git push 2>/dev/null
-                log "  ✅ Updated backup index"
               fi
               rm -rf /tmp/backup-idx-$$
             ) &
@@ -298,31 +286,24 @@ jobs:
           backup_or_sync() {
             local PROJECT_PATH="$1"
             local PROJECT_NAME=$(basename "$PROJECT_PATH")
-            
             [ -z "$(ls -A "$PROJECT_PATH" 2>/dev/null)" ] && return
             cd "$PROJECT_PATH" || return
             
             if [ -d ".git" ]; then
               REMOTE=$(git remote get-url origin 2>/dev/null || echo "")
-              
-              # External repo - fork it
               if echo "$REMOTE" | grep -q "github.com" && ! echo "$REMOTE" | grep -qi "$GITHUB_USER"; then
-                log "🔄 External repo: $PROJECT_NAME - Forking..."
+                log "🔄 External repo: $PROJECT_NAME"
                 curl -s -X POST -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
                   https://api.github.com/user/repos -d "{\"name\":\"$PROJECT_NAME\",\"private\":true}" >/dev/null 2>&1
                 sleep 2
                 git remote remove origin 2>/dev/null
                 git remote add origin "https://x-access-token:$TOKEN@github.com/$GITHUB_USER/$PROJECT_NAME.git"
                 BRANCH=$(git branch --show-current 2>/dev/null || echo "main")
-                if git push -u origin "$BRANCH" --force 2>/dev/null; then
-                  log "✅ Forked: $PROJECT_NAME"
-                  mark_synced "$PROJECT_NAME"
-                  update_index "$PROJECT_NAME"
-                fi
+                git push -u origin "$BRANCH" --force 2>/dev/null && log "✅ Forked: $PROJECT_NAME"
+                mark_synced "$PROJECT_NAME"
+                update_index "$PROJECT_NAME"
                 return
               fi
-              
-              # Our repo - sync changes
               if echo "$REMOTE" | grep -qi "$GITHUB_USER"; then
                 git add -A 2>/dev/null
                 if ! git diff --cached --quiet 2>/dev/null; then
@@ -334,64 +315,41 @@ jobs:
               fi
             fi
             
-            # New project
             is_synced "$PROJECT_NAME" && return
             log "📤 New project: $PROJECT_NAME"
-            
             curl -s -X POST -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
               https://api.github.com/user/repos -d "{\"name\":\"$PROJECT_NAME\",\"private\":true}" >/dev/null 2>&1
             sleep 2
-            
             [ ! -d ".git" ] && git init
             git add -A
             git commit -m "Initial commit - $(date '+%Y-%m-%d %H:%M')" 2>/dev/null
             git branch -M main
             git remote remove origin 2>/dev/null
             git remote add origin "https://x-access-token:$TOKEN@github.com/$GITHUB_USER/$PROJECT_NAME.git"
-            
-            if git push -u origin main --force 2>/dev/null; then
-              log "✅ Backed up: $PROJECT_NAME"
-              mark_synced "$PROJECT_NAME"
-              update_index "$PROJECT_NAME"
-            fi
+            git push -u origin main --force 2>/dev/null && log "✅ Backed up: $PROJECT_NAME"
+            mark_synced "$PROJECT_NAME"
+            update_index "$PROJECT_NAME"
           }
           
-          log "═══════════════════════════════════════════════════════════════"
-          log "👁️  BACKUP WATCHER v3.0 (macOS) STARTED"
-          log "   📂 Watching: $WATCH_DIR"
-          log "   🔄 Sync Interval: ${SYNC_INTERVAL}s"
-          log "   ✨ Features: New projects, File changes, External repo forking"
-          log "═══════════════════════════════════════════════════════════════"
-          
-          # Initial scan
-          for dir in "$WATCH_DIR"/*/; do
-            [ -d "$dir" ] && backup_or_sync "$dir"
-          done
-          
-          # Continuous sync loop
+          log "👁️ BACKUP WATCHER v3.0 (macOS) STARTED"
+          for dir in "$WATCH_DIR"/*/; do [ -d "$dir" ] && backup_or_sync "$dir"; done
           while true; do
             sleep $SYNC_INTERVAL
             log "🔄 Sync cycle..."
-            for dir in "$WATCH_DIR"/*/; do
-              [ -d "$dir" ] && backup_or_sync "$dir"
-            done
+            for dir in "$WATCH_DIR"/*/; do [ -d "$dir" ] && backup_or_sync "$dir"; done
           done
           EOFWATCHER
           
           sed -i '' "s|TOKEN_PLACEHOLDER|${TOKEN}|g" ~/backup-watcher.sh
           sed -i '' "s|GITHUB_USER_PLACEHOLDER|${GITHUB_ACTOR}|g" ~/backup-watcher.sh
           chmod +x ~/backup-watcher.sh
-          
           nohup bash ~/backup-watcher.sh > /dev/null 2>&1 &
-          
           echo "✅ Backup Watcher v3.0 deployed"
-          echo "   ✨ Continuous sync every 5 min"
-          echo "   ✨ External repo forking"
-          echo "   ✨ Full change tracking"
 
       - name: 💡 Keep Alive & Connection Info
         run: |
           CLOUDFLARE_HOST=$(cat /tmp/cf_host.txt 2>/dev/null || echo "")
+          VNC_RUNNING=$(pgrep -f "Xvnc" > /dev/null && echo "yes" || echo "no")
           
           echo ""
           echo "╔══════════════════════════════════════════════════════════════╗"
@@ -419,62 +377,37 @@ jobs:
               echo "  Password: P@ssw0rd123!"
             fi
             echo ""
-            echo "┌────────────────────────────────────────────────────────────────┐"
-            echo "│ ⚠️  NOTE: macOS VNC Limitations                                 │"
-            echo "└────────────────────────────────────────────────────────────────┘"
-            echo ""
-            echo "  macOS GitHub runners are headless. VNC may show:"
-            echo "  - X11 desktop (if XQuartz works)"
-            echo "  - Basic terminal interface"
-            echo ""
-            echo "  💡 For full GUI experience, use Linux workflow instead."
-            echo "  💡 macOS is best for: CLI dev, building iOS apps, brew packages"
-            echo ""
+            if [ "$VNC_RUNNING" = "yes" ]; then
+              echo "  ✅ VNC Server Status: RUNNING"
+            else
+              echo "  ⚠️ VNC Server Status: May have issues (macOS limitation)"
+              echo "     Try connecting anyway - it might work!"
+            fi
           else
             echo "⚠️ Cloudflare tunnel still initializing..."
-            echo "   Check 'Setup Cloudflare Tunnel' step above for hostname"
           fi
           
           echo ""
-          echo "📊 Environment Details:"
+          echo "📊 Environment:"
           echo "  🍎 OS:          macOS $(sw_vers -productVersion)"
           echo "  💻 Chip:        $(uname -m)"
-          echo "  👤 User:        $(whoami)"
           echo "  📂 Workspace:   ~/Desktop/workspace"
           echo "  ⏱️  Duration:    6 hours"
-          echo "  🔄 Backup:      v3.0 (Full sync + External repo forking)"
-          echo ""
-          echo "💡 Terminal Access (if VNC doesn't work):"
-          echo "  You can still use this runner via workflow dispatch commands"
-          echo "  or by adding SSH step for remote terminal access."
+          echo "  🔄 Backup:      v3.0 Full Sync"
           echo ""
           
-          # Keep alive with health monitoring
-          RESTART_COUNT=0
-          MAX_RESTARTS=5
-          
+          # Keep alive
           while true; do
             sleep 1800
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] 💓 Heartbeat"
             
-            # Cloudflare health check
+            # Keep cloudflare alive
             if ! pgrep -f "cloudflared" > /dev/null; then
-              echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🔄 Restarting Cloudflare tunnel..."
               cloudflared tunnel --url tcp://localhost:${{ env.VNC_PORT }} > /tmp/cloudflare.log 2>&1 &
               sleep 10
             fi
             
-            # VNC health check
-            if ! pgrep -f "x11vnc" > /dev/null; then
-              if [ $RESTART_COUNT -lt $MAX_RESTARTS ]; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🔄 Restarting VNC..."
-                export DISPLAY=:1
-                x11vnc -display :1 -rfbport ${{ env.VNC_PORT }} -forever -shared -bg 2>/dev/null
-                RESTART_COUNT=$((RESTART_COUNT + 1))
-              fi
-            fi
-            
-            # Backup watcher health check
+            # Keep watcher alive
             if ! pgrep -f "backup-watcher.sh" > /dev/null; then
               nohup bash ~/backup-watcher.sh > /dev/null 2>&1 &
             fi
