@@ -1,4 +1,4 @@
-name: ☁️ Cloud Workstation - macOS (Debug Mode)
+name: ☁️ Cloud Workstation - macOS (TigerVNC Fix)
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ on:
           - '2560x1440'
 
 env:
-  VNC_PORT: '5900'  # Switched to standard port
+  VNC_PORT: '5900'
   VNC_DISPLAY: ':99'
   VNC_GEOMETRY: ${{ github.event.inputs.vnc_resolution || '1920x1080' }}
   WORKSPACE_DIR: '$HOME/Desktop/workspace'
@@ -38,91 +38,68 @@ jobs:
           echo "🔧 Resolution: ${{ env.VNC_GEOMETRY }}"
           echo ""
 
-      - name: 🖥️ Install VNC Server
+      - name: 🖥️ Install TigerVNC
         run: |
-          echo "📦 Installing VNC components..."
-          brew install --cask xquartz
-          brew install x11vnc
-          echo "✅ VNC components installed"
-
-      - name: 🔐 Configure VNC Password
-        run: |
-          echo "🔧 Configuring VNC password..."
-          VNC_PASS="${{ secrets.VNC_PASSWORD }}"
-          [ -z "$VNC_PASS" ] && VNC_PASS="mypassword"
-          mkdir -p ~/.vnc
-          x11vnc -storepasswd "$VNC_PASS" ~/.vnc/passwd
-          mkdir -p ~/Desktop/workspace
-          echo "✅ VNC password configured"
-
-      - name: 🚀 Start Virtual Display & VNC Server (Deep Debug)
-        run: |
-          echo "🚀 Starting virtual display and VNC server..."
+          echo "📦 Installing TigerVNC..."
+          brew install tiger-vnc
+          brew install xterm
+          echo "✅ TigerVNC installed"
           
-          WIDTH=$(echo "${{ env.VNC_GEOMETRY }}" | cut -d'x' -f1)
-          HEIGHT=$(echo "${{ env.VNC_GEOMETRY }}" | cut -d'x' -f2)
+          # Check for binaries
+          which Xvnc && echo "✅ Xvnc found" || echo "❌ Xvnc missing"
+
+      - name: 🚀 Start Xvnc (TigerVNC)
+        run: |
+          echo "🚀 Starting Xvnc server..."
           
-          # Start Xvfb (Standard :99 display)
-          # Listening on TCP explicitly
-          /opt/X11/bin/Xvfb :99 -screen 0 ${WIDTH}x${HEIGHT}x24 -listen tcp &
-          XVFB_PID=$!
-          echo "Xvfb PID: $XVFB_PID"
+          # Start Xvnc directly
+          # -localhost: Only listen on 127.0.0.1 (IPv4)
+          # -SecurityTypes None: No password (handled by tunnel)
+          # -geometry: Set resolution
+          
+          Xvnc :99 \
+            -geometry ${{ env.VNC_GEOMETRY }} \
+            -depth 24 \
+            -rfbport 5900 \
+            -localhost \
+            -SecurityTypes None \
+            -AlwaysShared \
+            -AcceptKeyEvents \
+            -AcceptPointerEvents \
+            -SendCutText \
+            -AcceptCutText &
+            
+          XVNC_PID=$!
+          echo "Xvnc PID: $XVNC_PID"
           
           sleep 5
-            
-          # Verify Xvfb port (6099)
-          echo "🔍 Checking Xvfb port (6099)..."
-          netstat -an | grep 6099 || echo "⚠️ Port 6099 (X11) NOT found"
-
+          
+          # Verify Process
+          if ps -p $XVNC_PID > /dev/null; then
+             echo "✅ Xvnc is RUNNING"
+          else
+             echo "❌ Xvnc failed to start!"
+             exit 1
+          fi
+          
+          # Set DISPLAY for clients
           export DISPLAY=:99
           
-          # Start xterm
+          # Start terminal
           xterm -display :99 -geometry 120x40+10+10 -fs 14 -title "macOS Terminal" &
           
           sleep 2
-            
-          # Start x11vnc with explicit logging
-          # Using -localhost allows only 127.0.0.1 connections
-          echo "Starting x11vnc on Port 5900..."
           
-          x11vnc \
-            -display :99 \
-            -rfbport 5900 \
-            -localhost \
-            -rfbauth ~/.vnc/passwd \
-            -forever \
-            -shared \
-            -bg \
-            -o /tmp/x11vnc.log 2>&1
-            
-          sleep 5
-            
-          # DEBUGGING CONNECTIVITY
-          echo "🔍 === DEBUG: Checking Connectivity ==="
-          
-          # 1. Check Process
-          if pgrep x11vnc > /dev/null; then
-            echo "✅ x11vnc is RUNNING (PID: $(pgrep x11vnc))"
-          else
-            echo "❌ x11vnc CRASHED immediately!"
-            cat /tmp/x11vnc.log
-            exit 1
-          fi
-          
-          # 2. Check Port Listening
+          # Check Port 5900
           echo "🔍 Checking Port 5900..."
-          if netstat -an | grep "\.5900 " | grep LISTEN; then
-            echo "✅ Port 5900 IS LISTENING"
-          else
-            echo "❌ Port 5900 IS NOT LISTENING!"
-            netstat -an | grep 5900
-            exit 1
-          fi
+          netstat -an | grep "\.5900 " | grep LISTEN || {
+             echo "❌ Port 5900 NOT listening!"
+             exit 1
+          }
+          echo "✅ Port 5900 listening (IPv4/IPv6)"
           
-          # 3. Test Local Connection
-          echo "🔍 Testing local connection to 127.0.0.1:5900..."
-          # Scan with nc
-          nc -z -v 127.0.0.1 5900 || echo "❌ Netcat connection refused!"
+          # Save PID
+          echo $XVNC_PID > /tmp/vnc_pid.txt
 
       - name: ☁️ Setup Cloudflare Tunnel
         run: |
@@ -130,7 +107,7 @@ jobs:
           
           brew install cloudflare/cloudflare/cloudflared
           
-          # Point explicitly to localhost:5900
+          # Tunnel to localhost:5900
           cloudflared tunnel --url tcp://localhost:5900 > /tmp/cloudflare.log 2>&1 &
           
           echo "⏳ Waiting for tunnel..."
@@ -238,7 +215,7 @@ jobs:
           CLOUDFLARE_HOST=$(cat /tmp/cf_host.txt 2>/dev/null || echo "")
           echo ""
           echo "╔══════════════════════════════════════════════════════════════╗"
-          echo "║       🍎 macOS CLOUD WORKSTATION READY (DEBUG) 🍎           ║"
+          echo "║       🍎 macOS CLOUD WORKSTATION READY (TigerVNC) 🍎        ║"
           echo "╚══════════════════════════════════════════════════════════════╝"
           echo ""
           if [ -n "$CLOUDFLARE_HOST" ]; then
@@ -253,12 +230,10 @@ jobs:
             echo "└────────────────────────────────────────────────────────────┘"
             echo ""
             echo "  Server:   localhost:5900"
-            echo "  Password: mypassword"
+            echo "  Password: (No Password Required - Tunnel Secured)"
             echo ""
-          else
-            echo "⚠️ Tunnel initializing..."
           fi
-          echo "📊 Environment: macOS $(sw_vers -productVersion) | Port 5900"
+          echo "📊 Environment: macOS $(sw_vers -productVersion) | TigerVNC"
           
           while true; do
             sleep 1800
