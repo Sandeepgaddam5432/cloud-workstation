@@ -1,9 +1,21 @@
-name: ☁️ Cloud Workstation - macOS (SSH + ngrok)
+name: ☁️ Cloud Workstation - macOS
 
 on:
   workflow_dispatch:
+    inputs:
+      vnc_resolution:
+        description: 'VNC Resolution'
+        required: false
+        default: '1920x1080'
+        type: choice
+        options:
+          - '1920x1080'
+          - '1280x720'
+          - '2560x1440'
 
 env:
+  VNC_PORT: '5902'
+  VNC_GEOMETRY: ${{ github.event.inputs.vnc_resolution || '1920x1080' }}
   WORKSPACE_DIR: '$HOME/Desktop/workspace'
   BACKUP_REPO: 'backup-files'
 
@@ -15,72 +27,154 @@ jobs:
     steps:
       - name: 📊 System Information
         run: |
-          echo "╔══════════════════════════════════════════════════════════╗"
-          echo "║         macOS Cloud Workstation Setup                    ║"
-          echo "╚══════════════════════════════════════════════════════════╝"
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║         🍎 macOS Cloud Workstation Setup                     ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
           echo ""
           echo "🖥️  macOS Version: $(sw_vers -productVersion)"
           echo "💻 Chip: $(uname -m)"
           echo "📂 User: $(whoami)"
+          echo "🔧 Resolution: ${{ env.VNC_GEOMETRY }}"
           echo ""
 
-      - name: 🔐 Setup SSH Access via ngrok
-        env:
-          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+      - name: 🖥️ Install XQuartz & VNC Server
         run: |
-          echo "🔧 Setting up SSH access..."
+          echo "📦 Installing XQuartz and VNC components..."
           
-          # Install ngrok
-          brew install ngrok/ngrok/ngrok
+          # Install XQuartz (X11 for macOS)
+          brew install --cask xquartz
           
-          # Configure ngrok if token is provided
-          if [ -n "$NGROK_AUTH_TOKEN" ]; then
-            ngrok config add-authtoken "$NGROK_AUTH_TOKEN"
-            echo "✅ ngrok authenticated"
-          else
-            echo "⚠️ No NGROK_AUTH_TOKEN secret - using free tier (limited)"
+          # Install x11vnc for virtual display VNC
+          brew install x11vnc
+          
+          # Install tigervnc-viewer for testing (optional)
+          brew install tiger-vnc
+          
+          echo "✅ XQuartz and VNC installed"
+
+      - name: 🔐 Configure VNC Server with Virtual Display
+        run: |
+          echo "🔧 Configuring VNC with virtual X11 display..."
+          
+          # Set VNC password
+          VNC_PASS="${{ secrets.VNC_PASSWORD }}"
+          [ -z "$VNC_PASS" ] && VNC_PASS="P@ssw0rd123!"
+          
+          # Create VNC password file
+          mkdir -p ~/.vnc
+          x11vnc -storepasswd "$VNC_PASS" ~/.vnc/passwd
+          
+          # Create workspace directory
+          mkdir -p ~/Desktop/workspace
+          
+          echo "✅ VNC password configured"
+
+      - name: 🚀 Start Virtual Display & VNC Server
+        run: |
+          echo "🚀 Starting virtual display and VNC server..."
+          
+          # Parse resolution
+          RESOLUTION="${{ env.VNC_GEOMETRY }}"
+          WIDTH=$(echo $RESOLUTION | cut -d'x' -f1)
+          HEIGHT=$(echo $RESOLUTION | cut -d'x' -f2)
+          
+          # Start XQuartz with virtual display
+          export DISPLAY=:1
+          
+          # Use Xvfb-like approach with XQuartz
+          # Start headless X server
+          /opt/X11/bin/Xvfb :1 -screen 0 ${WIDTH}x${HEIGHT}x24 &
+          XVFB_PID=$!
+          echo "Xvfb PID: $XVFB_PID"
+          
+          sleep 3
+          
+          # Verify X server is running
+          if ! ps -p $XVFB_PID > /dev/null 2>&1; then
+            echo "⚠️ Xvfb failed, trying alternative..."
+            # Alternative: Use XQuartz directly
+            /opt/X11/bin/X :1 -screen 0 ${WIDTH}x${HEIGHT}x24 &
+            sleep 3
           fi
           
-          # Create SSH user password
-          SSH_PASS="${{ secrets.SSH_PASSWORD }}"
-          [ -z "$SSH_PASS" ] && SSH_PASS="P@ssw0rd123!"
+          export DISPLAY=:1
           
-          # Enable SSH and set password
-          echo "🔑 Configuring SSH..."
+          # Start a simple window manager (optional, for better experience)
+          # Some lightweight alternatives
           
-          # Set runner password for SSH login
-          echo "runner:$SSH_PASS" | sudo chpasswd 2>/dev/null || {
-            # Alternative method for macOS
-            sudo dscl . -passwd /Users/runner "$SSH_PASS" 2>/dev/null || true
-          }
+          # Start x11vnc server
+          x11vnc -display :1 \
+            -rfbport ${{ env.VNC_PORT }} \
+            -passwd "$(cat ~/.vnc/passwd 2>/dev/null || echo 'P@ssw0rd123!')" \
+            -forever \
+            -shared \
+            -noxdamage \
+            -noxfixes \
+            -noxrecord \
+            -bg \
+            -o /tmp/x11vnc.log
           
-          # Enable SSH
-          sudo systemsetup -setremotelogin on 2>/dev/null || {
-            sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
-          }
+          sleep 3
           
-          echo "✅ SSH enabled"
+          # Verify VNC is running
+          if pgrep -f "x11vnc" > /dev/null; then
+            echo "✅ VNC Server running on port ${{ env.VNC_PORT }}"
+            echo "📊 VNC Process:"
+            pgrep -a x11vnc
+          else
+            echo "❌ VNC failed to start"
+            cat /tmp/x11vnc.log 2>/dev/null
+            
+            # Fallback: Try native screen sharing with workaround
+            echo "🔄 Trying alternative VNC setup..."
+            
+            # Install and use tightvnc as fallback
+            brew install tightvnc 2>/dev/null || true
+            
+            vncserver :2 -geometry ${{ env.VNC_GEOMETRY }} -depth 24 2>/dev/null || {
+              echo "⚠️ VNC setup challenging on macOS - using SSH as backup"
+            }
+          fi
           
-          # Start ngrok SSH tunnel in background
-          ngrok tcp 22 --log=stdout > /tmp/ngrok.log 2>&1 &
+          # Save PID for cleanup
+          pgrep x11vnc > /tmp/vnc_pid.txt 2>/dev/null || true
+
+      - name: ☁️ Setup Cloudflare Tunnel
+        run: |
+          echo "🌐 Setting up Cloudflare tunnel..."
           
-          echo "⏳ Waiting for ngrok tunnel..."
-          sleep 10
+          # Install cloudflared
+          brew install cloudflare/cloudflare/cloudflared
           
-          # Extract ngrok URL
+          # Determine which port to tunnel
+          VNC_ACTIVE_PORT="${{ env.VNC_PORT }}"
+          
+          # Start tunnel
+          cloudflared tunnel --url tcp://localhost:$VNC_ACTIVE_PORT > /tmp/cloudflare.log 2>&1 &
+          CF_PID=$!
+          echo $CF_PID > /tmp/cf_pid.txt
+          
+          echo "⏳ Waiting for Cloudflare tunnel..."
+          sleep 15
+          
+          # Extract hostname
+          TUNNEL_READY=false
           for i in {1..30}; do
-            NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | grep -oE 'tcp://[0-9a-z.-]+:[0-9]+' | head -1)
-            if [ -n "$NGROK_URL" ]; then
-              echo "$NGROK_URL" > /tmp/ngrok_url.txt
-              echo "✅ ngrok tunnel: $NGROK_URL"
+            HOSTNAME=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflare.log | head -1 | sed 's|https://||')
+            if [ -n "$HOSTNAME" ]; then
+              echo "$HOSTNAME" > /tmp/cf_host.txt
+              echo "✅ Cloudflare tunnel established"
+              echo "🔗 Hostname: $HOSTNAME"
+              TUNNEL_READY=true
               break
             fi
             sleep 2
           done
           
-          if [ -z "$NGROK_URL" ]; then
-            echo "⚠️ ngrok may still be initializing..."
-            cat /tmp/ngrok.log | tail -20
+          if [ "$TUNNEL_READY" = false ]; then
+            echo "⚠️ Tunnel still initializing..."
+            echo "📋 Logs:"
+            tail -20 /tmp/cloudflare.log
           fi
 
       - name: 🐍 Install Python
@@ -99,11 +193,17 @@ jobs:
           npm --version
           echo "✅ Node.js installed"
 
-      - name: 💻 Install Visual Studio Code
+      - name: 💻 Install Development Tools
         run: |
-          echo "💻 Installing VS Code..."
-          brew install --cask visual-studio-code
-          echo "✅ VS Code installed"
+          echo "💻 Installing development tools..."
+          
+          # VS Code (can be accessed via Remote SSH or locally if VNC works)
+          brew install --cask visual-studio-code || echo "VS Code install skipped"
+          
+          # Essential CLI tools
+          brew install wget curl jq git
+          
+          echo "✅ Development tools installed"
 
       - name: ⚙️ Configure Git & Workspace
         run: |
@@ -112,10 +212,9 @@ jobs:
           git config --global user.email "${GITHUB_ACTOR}@users.noreply.github.com"
           git config --global init.defaultBranch main
           
-          # Create workspace
           mkdir -p ~/Desktop/workspace
           
-          echo "✅ Git & workspace configured"
+          echo "✅ Git configured for: ${GITHUB_ACTOR}"
 
       - name: 📥 Restore Projects from Backup
         run: |
@@ -127,15 +226,17 @@ jobs:
           BACKUP_URL="https://x-access-token:${TOKEN}@github.com/${GITHUB_ACTOR}/${{ env.BACKUP_REPO }}.git"
           
           if git ls-remote "$BACKUP_URL" &>/dev/null; then
-            echo "📂 Restoring projects..."
+            echo "📂 Backup repository found - restoring projects..."
             git clone --depth=1 "$BACKUP_URL" /tmp/backup-index
             
             if [ -f /tmp/backup-index/README.md ]; then
               RESTORE_COUNT=0
+              
               while IFS= read -r REPO_PATH; do
                 [ -z "$REPO_PATH" ] && continue
                 REPO_NAME=$(basename "$REPO_PATH")
                 echo "  📦 Restoring: $REPO_NAME"
+                
                 if git clone --depth=1 \
                   "https://x-access-token:${TOKEN}@github.com/${REPO_PATH}.git" \
                   "$HOME/Desktop/workspace/${REPO_NAME}" 2>/dev/null; then
@@ -145,7 +246,8 @@ jobs:
                   echo "    ⚠️ Failed"
                 fi
               done < <(grep -oE '^\s*-\s*\S+' /tmp/backup-index/README.md | sed 's/^.*- *//')
-              echo "✅ Restored $RESTORE_COUNT projects"
+              
+              echo "✅ Restored $RESTORE_COUNT project(s)"
             fi
             rm -rf /tmp/backup-index
           else
@@ -154,16 +256,15 @@ jobs:
 
       - name: 🔄 Deploy Backup Watcher v3.0
         run: |
-          echo "🔧 Deploying backup watcher v3.0..."
+          echo "🔧 Deploying Backup Watcher v3.0..."
           
           TOKEN="${{ secrets.GH_TOKEN }}"
           [ -z "$TOKEN" ] && TOKEN="${{ secrets.GITHUB_TOKEN }}"
           
-          # Create v3.0 backup watcher for macOS
           cat > ~/backup-watcher.sh << 'EOFWATCHER'
           #!/bin/bash
           
-          # BACKUP WATCHER v3.0 - macOS Edition
+          # BACKUP WATCHER v3.0 - macOS Edition with Full Sync
           WATCH_DIR="$HOME/Desktop/workspace"
           GITHUB_USER="GITHUB_USER_PLACEHOLDER"
           TOKEN="TOKEN_PLACEHOLDER"
@@ -183,11 +284,11 @@ jobs:
             local PROJECT_NAME="$1"
             (
               rm -rf /tmp/backup-idx-$$
-              git clone --depth=1 "https://x-access-token:$TOKEN@github.com/$GITHUB_USER/$BACKUP_REPO.git" /tmp/backup-idx-$$ 2>/dev/null
+              git clone --depth=1 "https://x-access-token:$TOKEN@github.com/$GITHUB_USER/$BACKUP_REPO.git" /tmp/backup-idx-$$ 2>/dev/null || return
               cd /tmp/backup-idx-$$ 2>/dev/null || return
               if ! grep -q "$GITHUB_USER/$PROJECT_NAME" README.md 2>/dev/null; then
                 echo "- $GITHUB_USER/$PROJECT_NAME" >> README.md
-                git add . && git commit -m "Add $PROJECT_NAME" && git push 2>/dev/null
+                git add . && git commit -m "Add $PROJECT_NAME" 2>/dev/null && git push 2>/dev/null
                 log "  ✅ Updated backup index"
               fi
               rm -rf /tmp/backup-idx-$$
@@ -256,9 +357,10 @@ jobs:
           }
           
           log "═══════════════════════════════════════════════════════════════"
-          log "👁️  BACKUP WATCHER v3.0 STARTED (macOS)"
+          log "👁️  BACKUP WATCHER v3.0 (macOS) STARTED"
           log "   📂 Watching: $WATCH_DIR"
           log "   🔄 Sync Interval: ${SYNC_INTERVAL}s"
+          log "   ✨ Features: New projects, File changes, External repo forking"
           log "═══════════════════════════════════════════════════════════════"
           
           # Initial scan
@@ -280,84 +382,99 @@ jobs:
           sed -i '' "s|GITHUB_USER_PLACEHOLDER|${GITHUB_ACTOR}|g" ~/backup-watcher.sh
           chmod +x ~/backup-watcher.sh
           
-          # Start watcher
           nohup bash ~/backup-watcher.sh > /dev/null 2>&1 &
           
-          echo "✅ Backup Watcher v3.0 deployed (macOS)"
+          echo "✅ Backup Watcher v3.0 deployed"
           echo "   ✨ Continuous sync every 5 min"
           echo "   ✨ External repo forking"
+          echo "   ✨ Full change tracking"
 
       - name: 💡 Keep Alive & Connection Info
         run: |
-          NGROK_URL=$(cat /tmp/ngrok_url.txt 2>/dev/null || echo "")
+          CLOUDFLARE_HOST=$(cat /tmp/cf_host.txt 2>/dev/null || echo "")
           
           echo ""
           echo "╔══════════════════════════════════════════════════════════════╗"
           echo "║                                                              ║"
-          echo "║    🚀 macOS CLOUD WORKSTATION READY (SSH ACCESS) 🚀         ║"
+          echo "║    🍎 macOS CLOUD WORKSTATION READY  🍎                      ║"
           echo "║                                                              ║"
           echo "╚══════════════════════════════════════════════════════════════╝"
           echo ""
           
-          if [ -n "$NGROK_URL" ]; then
-            # Parse host and port from ngrok URL
-            NGROK_HOST=$(echo "$NGROK_URL" | sed 's|tcp://||' | cut -d':' -f1)
-            NGROK_PORT=$(echo "$NGROK_URL" | sed 's|tcp://||' | cut -d':' -f2)
-            
+          if [ -n "$CLOUDFLARE_HOST" ]; then
             echo "┌────────────────────────────────────────────────────────────────┐"
-            echo "│ 🔐 SSH CONNECTION                                              │"
+            echo "│ 📋 STEP 1: Run on your LOCAL machine                           │"
             echo "└────────────────────────────────────────────────────────────────┘"
             echo ""
-            echo "  ssh -p $NGROK_PORT runner@$NGROK_HOST"
+            echo "  cloudflared access tcp --hostname $CLOUDFLARE_HOST --url 127.0.0.1:${{ env.VNC_PORT }}"
             echo ""
-            if [ -n "${{ secrets.SSH_PASSWORD }}" ]; then
-              echo "  Password: [Your SSH_PASSWORD secret]"
+            echo "┌────────────────────────────────────────────────────────────────┐"
+            echo "│ 🖥️  STEP 2: Connect with VNC Viewer                             │"
+            echo "└────────────────────────────────────────────────────────────────┘"
+            echo ""
+            echo "  Server:   localhost:${{ env.VNC_PORT }}"
+            if [ -n "${{ secrets.VNC_PASSWORD }}" ]; then
+              echo "  Password: [Your VNC_PASSWORD secret]"
             else
               echo "  Password: P@ssw0rd123!"
             fi
             echo ""
             echo "┌────────────────────────────────────────────────────────────────┐"
-            echo "│ 💻 REMOTE VS CODE (SSH Extension)                              │"
+            echo "│ ⚠️  NOTE: macOS VNC Limitations                                 │"
             echo "└────────────────────────────────────────────────────────────────┘"
             echo ""
-            echo "  1. Install 'Remote - SSH' extension in VS Code"
-            echo "  2. Press F1 → 'Remote-SSH: Connect to Host'"
-            echo "  3. Enter: ssh://runner@$NGROK_HOST:$NGROK_PORT"
+            echo "  macOS GitHub runners are headless. VNC may show:"
+            echo "  - X11 desktop (if XQuartz works)"
+            echo "  - Basic terminal interface"
+            echo ""
+            echo "  💡 For full GUI experience, use Linux workflow instead."
+            echo "  💡 macOS is best for: CLI dev, building iOS apps, brew packages"
             echo ""
           else
-            echo "⚠️ ngrok tunnel not ready - check 'Setup SSH Access' step"
+            echo "⚠️ Cloudflare tunnel still initializing..."
+            echo "   Check 'Setup Cloudflare Tunnel' step above for hostname"
           fi
           
           echo ""
           echo "📊 Environment Details:"
           echo "  🍎 OS:          macOS $(sw_vers -productVersion)"
           echo "  💻 Chip:        $(uname -m)"
-          echo "  👤 User:        runner"
+          echo "  👤 User:        $(whoami)"
           echo "  📂 Workspace:   ~/Desktop/workspace"
           echo "  ⏱️  Duration:    6 hours"
           echo "  🔄 Backup:      v3.0 (Full sync + External repo forking)"
           echo ""
-          echo "💡 Useful Commands:"
-          echo "  cd ~/Desktop/workspace    # Go to workspace"
-          echo "  code .                    # Open VS Code (via SSH)"
-          echo "  brew install <package>    # Install packages"
+          echo "💡 Terminal Access (if VNC doesn't work):"
+          echo "  You can still use this runner via workflow dispatch commands"
+          echo "  or by adding SSH step for remote terminal access."
           echo ""
           
-          # Keep alive with heartbeat
-          COUNTER=0
+          # Keep alive with health monitoring
+          RESTART_COUNT=0
+          MAX_RESTARTS=5
+          
           while true; do
             sleep 1800
-            COUNTER=$((COUNTER + 1))
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 💓 Heartbeat #$COUNTER"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 💓 Heartbeat"
             
-            # Keep ngrok alive
-            if ! pgrep -f "ngrok" > /dev/null; then
-              echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🔄 Restarting ngrok..."
-              ngrok tcp 22 --log=stdout > /tmp/ngrok.log 2>&1 &
+            # Cloudflare health check
+            if ! pgrep -f "cloudflared" > /dev/null; then
+              echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🔄 Restarting Cloudflare tunnel..."
+              cloudflared tunnel --url tcp://localhost:${{ env.VNC_PORT }} > /tmp/cloudflare.log 2>&1 &
               sleep 10
             fi
             
-            # Keep watcher alive
+            # VNC health check
+            if ! pgrep -f "x11vnc" > /dev/null; then
+              if [ $RESTART_COUNT -lt $MAX_RESTARTS ]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🔄 Restarting VNC..."
+                export DISPLAY=:1
+                x11vnc -display :1 -rfbport ${{ env.VNC_PORT }} -forever -shared -bg 2>/dev/null
+                RESTART_COUNT=$((RESTART_COUNT + 1))
+              fi
+            fi
+            
+            # Backup watcher health check
             if ! pgrep -f "backup-watcher.sh" > /dev/null; then
               nohup bash ~/backup-watcher.sh > /dev/null 2>&1 &
             fi
