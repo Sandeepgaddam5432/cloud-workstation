@@ -298,7 +298,7 @@ jobs:
                 if git clone --depth=1 \
                   "https://x-access-token:${TOKEN}@github.com/${REPO_PATH}.git" \
                   "$HOME/Desktop/workspace/${REPO_NAME}" 2>/dev/null; then
-                  ((RESTORE_COUNT++))
+                  RESTORE_COUNT=$((RESTORE_COUNT + 1))
                   echo "    ✅ Restored successfully"
                 else
                   echo "    ⚠️  Failed to restore"
@@ -683,7 +683,7 @@ jobs:
                 sleep 5
                 
                 if pgrep -f "Xtigervnc.*${{ env.VNC_DISPLAY }}" > /dev/null; then
-                  ((RESTART_COUNT++))
+                  RESTART_COUNT=$((RESTART_COUNT + 1))
                   echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ VNC restarted (attempt $RESTART_COUNT/$MAX_RESTARTS)"
                 fi
               fi
