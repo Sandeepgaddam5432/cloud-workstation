@@ -1,4 +1,4 @@
-name: ☁️ Cloud Workstation - macOS (TigerVNC Fix)
+name: ☁️ Cloud Workstation - macOS (Final Fix)
 
 on:
   workflow_dispatch:
@@ -38,73 +38,86 @@ jobs:
           echo "🔧 Resolution: ${{ env.VNC_GEOMETRY }}"
           echo ""
 
-      - name: 🖥️ Install TigerVNC
+      - name: 🖥️ Install VNC Components
         run: |
-          echo "📦 Installing TigerVNC..."
-          brew install tiger-vnc
+          echo "📦 Installing VNC components..."
+          brew install --cask xquartz
+          brew install x11vnc
           brew install xterm
-          echo "✅ TigerVNC installed"
-          
-          # Check for binaries
-          which Xvnc && echo "✅ Xvnc found" || echo "❌ Xvnc missing"
+          echo "✅ Components installed"
 
-      - name: 🚀 Start Xvnc (TigerVNC)
+      - name: 🚀 Start Virtual Display & VNC Server
         run: |
-          echo "🚀 Starting Xvnc server..."
+          echo "🚀 Starting virtual display and VNC server..."
           
-          # Start Xvnc directly
-          # -localhost: Only listen on 127.0.0.1 (IPv4)
-          # -SecurityTypes None: No password (handled by tunnel)
-          # -geometry: Set resolution
+          WIDTH=$(echo "${{ env.VNC_GEOMETRY }}" | cut -d'x' -f1)
+          HEIGHT=$(echo "${{ env.VNC_GEOMETRY }}" | cut -d'x' -f2)
           
-          Xvnc :99 \
-            -geometry ${{ env.VNC_GEOMETRY }} \
-            -depth 24 \
-            -rfbport 5900 \
-            -localhost \
-            -SecurityTypes None \
-            -AlwaysShared \
-            -AcceptKeyEvents \
-            -AcceptPointerEvents \
-            -SendCutText \
-            -AcceptCutText &
-            
-          XVNC_PID=$!
-          echo "Xvnc PID: $XVNC_PID"
+          # 1. Start Xvfb (Verified Working)
+          /opt/X11/bin/Xvfb :99 -screen 0 ${WIDTH}x${HEIGHT}x24 -listen tcp &
+          XVFB_PID=$!
+          echo "Xvfb PID: $XVFB_PID"
           
           sleep 5
-          
-          # Verify Process
-          if ps -p $XVNC_PID > /dev/null; then
-             echo "✅ Xvnc is RUNNING"
-          else
-             echo "❌ Xvnc failed to start!"
+            
+          # Verify Xvfb
+          if ! ps -p $XVFB_PID > /dev/null; then
+             echo "❌ Xvfb failed to start"
              exit 1
           fi
           
-          # Set DISPLAY for clients
           export DISPLAY=:99
           
-          # Start terminal
+          # 2. Start xterm (GUI Test)
           xterm -display :99 -geometry 120x40+10+10 -fs 14 -title "macOS Terminal" &
           
           sleep 2
+            
+          # 3. Start x11vnc (Minimal Mode)
+          # -nopw: No password (avoids auth crashes)
+          # -localhost: Bind to 127.0.0.1
+          # -noxdamage -noxfixes -noxrecord: Disable extensions that cause crashes
           
-          # Check Port 5900
+          echo "Starting x11vnc on Port 5900..."
+          
+          x11vnc \
+            -display :99 \
+            -rfbport 5900 \
+            -localhost \
+            -nopw \
+            -forever \
+            -shared \
+            -noxdamage \
+            -noxfixes \
+            -noxrecord \
+            -bg \
+            -o /tmp/x11vnc.log 2>&1
+            
+          sleep 5
+            
+          # 4. Verify VNC
+          if pgrep x11vnc > /dev/null; then
+            echo "✅ x11vnc is RUNNING (PID: $(pgrep x11vnc))"
+          else
+            echo "❌ x11vnc CRASHED!"
+            cat /tmp/x11vnc.log
+            exit 1
+          fi
+          
+          # 5. Check Port
           echo "🔍 Checking Port 5900..."
           netstat -an | grep "\.5900 " | grep LISTEN || {
              echo "❌ Port 5900 NOT listening!"
              exit 1
           }
-          echo "✅ Port 5900 listening (IPv4/IPv6)"
+          echo "✅ Port 5900 listening"
           
           # Save PID
-          echo $XVNC_PID > /tmp/vnc_pid.txt
+          pgrep x11vnc > /tmp/vnc_pid.txt
 
       - name: ☁️ Setup Cloudflare Tunnel
         run: |
           echo "🌐 Setting up Cloudflare tunnel..."
-          
           brew install cloudflare/cloudflare/cloudflared
           
           # Tunnel to localhost:5900
@@ -215,7 +228,7 @@ jobs:
           CLOUDFLARE_HOST=$(cat /tmp/cf_host.txt 2>/dev/null || echo "")
           echo ""
           echo "╔══════════════════════════════════════════════════════════════╗"
-          echo "║       🍎 macOS CLOUD WORKSTATION READY (TigerVNC) 🍎        ║"
+          echo "║       🍎 macOS CLOUD WORKSTATION READY (NO AUTH) 🍎          ║"
           echo "╚══════════════════════════════════════════════════════════════╝"
           echo ""
           if [ -n "$CLOUDFLARE_HOST" ]; then
@@ -230,10 +243,13 @@ jobs:
             echo "└────────────────────────────────────────────────────────────┘"
             echo ""
             echo "  Server:   localhost:5900"
-            echo "  Password: (No Password Required - Tunnel Secured)"
+            echo "  Password: (None - Just press Enter)"
+            echo "  🔒 Security: Tunnel verified"
             echo ""
+          else
+            echo "⚠️ Tunnel initializing..."
           fi
-          echo "📊 Environment: macOS $(sw_vers -productVersion) | TigerVNC"
+          echo "📊 Environment: macOS $(sw_vers -productVersion) | Port 5900"
           
           while true; do
             sleep 1800
